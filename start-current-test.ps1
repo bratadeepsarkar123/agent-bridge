@@ -1,0 +1,1 @@
+﻿& 'C:\Users\brata\.local\bin\claude.exe' --resume 24f2b207-1068-4fff-88b3-97227d2a962f --strict-mcp-config --mcp-config 'C:\Users\brata\Downloads\claude\agent-bridge-experiment\mcp-24f2b207-1068-4fff-88b3-97227d2a962f.json' --dangerously-load-development-channels server:agent-bridge --model haiku --effort low
