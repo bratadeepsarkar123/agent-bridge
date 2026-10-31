@@ -71,13 +71,19 @@ class ClaudeAdapterProtocolTests(unittest.TestCase):
                          {"claude/channel": {}})
         self.assertIn("not user identity", response["result"]["instructions"])
 
-    def test_send_queues_from_claude_to_configured_codex_and_is_unconfirmed(self):
+    def test_send_requires_explicit_recipient_and_is_unconfirmed(self):
+        missing = self.adapter.call_tool({"name": "bridge_send", "arguments": {"text": "hello"}})
+        self.assertTrue(missing["isError"])
+        self.assertEqual([], self.broker.sent)
         self.adapter.process({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "bridge_send", "arguments": {"text": "hello"}},
+            "params": {"name": "bridge_send", "arguments": {"text": "hello", "recipient": "codex"}},
         })
         self.assertEqual(self.broker.sent, [("claude-session", "codex", "hello")])
         self.assertIn("delivery is unconfirmed", self.output_messages()[0]["result"]["content"][0]["text"])
+        self.adapter.process({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+        tools = {tool["name"]: tool for tool in self.output_messages()[-1]["result"]["tools"]}
+        self.assertIn("recipient", tools["bridge_send"]["inputSchema"]["required"])
 
     def test_group_send_tool_requires_explicit_recipients_and_batch_uuid(self):
         self.adapter.process({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

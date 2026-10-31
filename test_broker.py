@@ -32,6 +32,8 @@ class BrokerTest(unittest.TestCase):
         self.temp.cleanup()
 
     def call(self, path, body=None, token='test-token'):
+        if path == '/v1/register' and body is not None:
+            body = {'opt_in': True, **body}
         data = json.dumps(body).encode() if body is not None else None
         request = Request(self.url + path, data=data,
                           headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
@@ -61,6 +63,36 @@ class BrokerTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             self.call('/v1/messages', {'sender': 'codex-a', 'recipient': 'unknown', 'text': 'hi'})
         self.assertEqual(400, error.exception.code)
+
+    def test_legacy_registration_requires_fresh_explicit_opt_in(self):
+        old_db = Path(self.temp.name) / 'legacy.sqlite3'
+        with closing(sqlite3.connect(old_db)) as db, db:
+            db.execute('CREATE TABLE sessions (id TEXT PRIMARY KEY, kind TEXT NOT NULL, updated REAL NOT NULL)')
+            db.execute('INSERT INTO sessions VALUES (?, ?, ?)', ('legacy', 'codex', 1))
+        broker = Broker(old_db)
+        broker.register({'id': 'sender', 'kind': 'claude', 'opt_in': True})
+        self.assertEqual(['sender'], [s['id'] for s in broker.sessions()['sessions']])
+        for value in (None, False, 1, 'true'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                broker.register({'id': 'legacy', 'kind': 'codex', 'opt_in': value})
+        with self.assertRaises(ValueError):
+            broker.enqueue({'sender': 'sender', 'recipient': 'legacy', 'text': 'hello'})
+        with self.assertRaises(ValueError):
+            broker.inbox('legacy')
+        broker.register({'id': 'legacy', 'kind': 'codex', 'opt_in': True})
+        broker.enqueue({'sender': 'sender', 'recipient': 'legacy', 'text': 'hello'})
+        self.assertEqual('hello', broker.inbox('legacy')['messages'][0]['text'])
+
+    def test_old_queued_message_waits_for_sender_opt_in(self):
+        with closing(self.broker.connect()) as db, db:
+            db.execute('INSERT INTO sessions(id,kind,updated,opted_in) VALUES (?, ?, ?, 0)',
+                       ('old-sender', 'claude', 0))
+            db.execute('INSERT INTO messages(id,sender,recipient,text,status,created) VALUES (?,?,?,?,?,?)',
+                       ('old-message', 'old-sender', 'recipient', 'old text', 'queued', 0))
+        self.broker.register({'id': 'recipient', 'kind': 'codex', 'opt_in': True})
+        self.assertEqual([], self.broker.inbox('recipient')['messages'])
+        self.broker.register({'id': 'old-sender', 'kind': 'claude', 'opt_in': True})
+        self.assertEqual(['old text'], [m['text'] for m in self.broker.inbox('recipient')['messages']])
 
     def test_five_sessions_route_only_to_named_recipients(self):
         for ident in ('claude-1', 'claude-2', 'claude-3', 'codex-1', 'codex-2'):
@@ -109,7 +141,7 @@ class BrokerTest(unittest.TestCase):
 
     def test_group_fanout_rolls_back_all_recipients_on_insert_failure(self):
         for ident, kind in [('codex-sender', 'codex'), ('claude-a', 'claude'), ('claude-b', 'claude')]:
-            self.broker.register({'id': ident, 'kind': kind})
+            self.broker.register({'id': ident, 'kind': kind, 'opt_in': True})
         with closing(self.broker.connect()) as db, db:
             db.execute("""
                 CREATE TRIGGER reject_second_group_delivery
@@ -132,8 +164,8 @@ class BrokerTest(unittest.TestCase):
             self.assertEqual(0, db.execute('SELECT COUNT(*) FROM group_batch_deliveries').fetchone()[0])
 
     def test_group_fanout_rejects_unregistered_recipient_without_partial_delivery(self):
-        self.broker.register({'id': 'codex-sender', 'kind': 'codex'})
-        self.broker.register({'id': 'claude-a', 'kind': 'claude'})
+        self.broker.register({'id': 'codex-sender', 'kind': 'codex', 'opt_in': True})
+        self.broker.register({'id': 'claude-a', 'kind': 'claude', 'opt_in': True})
         with self.assertRaises(ValueError):
             self.broker.enqueue_group({
                 'batch_id': 'b7a4c497-3722-4f55-a635-b044af4a2691',
@@ -180,8 +212,8 @@ class BrokerTest(unittest.TestCase):
             else:
                 self.fail('test broker did not start')
             saved = Broker(db)
-            saved.register({'id': 'codex-test', 'kind': 'codex'})
-            saved.register({'id': 'claude-test', 'kind': 'claude'})
+            saved.register({'id': 'codex-test', 'kind': 'codex', 'opt_in': True})
+            saved.register({'id': 'claude-test', 'kind': 'claude', 'opt_in': True})
             saved.enqueue({'sender': 'codex-test', 'recipient': 'claude-test', 'text': 'pending'})
             process.terminate()
             process.wait(timeout=5)

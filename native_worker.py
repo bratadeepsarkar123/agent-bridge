@@ -81,13 +81,8 @@ def main():
         broker = BrokerClient()
         ledger = DeliveryLedger(ROOT / 'codex-native-ledger.sqlite3')
         previous = None
-        last_heartbeat = -30.0
         while True:
             try:
-                now = time.monotonic()
-                if now - last_heartbeat >= 30:
-                    broker.register(recipient, 'codex')
-                    last_heartbeat = now
                 results = drain_once(recipient, broker, ledger, idle_only=args.idle_only)
                 report = json.dumps(results, sort_keys=True)
                 if results and report != previous:

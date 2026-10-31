@@ -47,7 +47,7 @@ class BrokerClientTests(unittest.TestCase):
         self.assertEqual(request.full_url, "http://127.0.0.1:43123/v1/register")
         self.assertEqual(request.get_method(), "POST")
         self.assertEqual(request.get_header("Authorization"), "Bearer test-secret-token")
-        self.assertEqual(json.loads(request.data), {"id": "codex-session", "kind": "codex"})
+        self.assertEqual(json.loads(request.data), {"id": "codex-session", "kind": "codex", "opt_in": True})
         self.assertEqual(result, {"registered": True})
 
     def test_discover_uses_sessions_endpoint(self):

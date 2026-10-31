@@ -58,6 +58,11 @@ class Broker:
                     FOREIGN KEY(batch_id) REFERENCES group_batches(batch_id)
                 );
             """)
+            # Older registrations were sometimes created on another session's
+            # behalf. They are not evidence of that session opting in.
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(sessions)')}
+            if 'opted_in' not in columns:
+                db.execute('ALTER TABLE sessions ADD COLUMN opted_in INTEGER NOT NULL DEFAULT 0')
 
     def connect(self):
         db = sqlite3.connect(self.database, timeout=10)
@@ -72,18 +77,20 @@ class Broker:
         ident, kind = data.get('id'), data.get('kind')
         if not self.valid_id(ident) or kind not in ('claude', 'codex', 'system'):
             raise ValueError('invalid session id or kind')
+        if data.get('opt_in') is not True:
+            raise ValueError('explicit opt_in is required')
         with closing(self.connect()) as db, db:
             old = db.execute('SELECT kind FROM sessions WHERE id=?', (ident,)).fetchone()
             if old and old['kind'] != kind:
                 raise ValueError('session id belongs to another kind')
-            db.execute('INSERT INTO sessions VALUES (?, ?, ?) ON CONFLICT(id) '
-                       'DO UPDATE SET updated=excluded.updated', (ident, kind, time.time()))
+            db.execute('INSERT INTO sessions(id,kind,updated,opted_in) VALUES (?, ?, ?, 1) ON CONFLICT(id) '
+                       'DO UPDATE SET updated=excluded.updated,opted_in=1', (ident, kind, time.time()))
         return {'id': ident, 'kind': kind}
 
     def sessions(self):
         with closing(self.connect()) as db, db:
             return {'sessions': [dict(row) for row in db.execute(
-                'SELECT id, kind, updated FROM sessions ORDER BY id')]}
+                'SELECT id, kind, updated FROM sessions WHERE opted_in=1 ORDER BY id')]}
 
     def enqueue(self, data):
         sender, recipient, text = (data.get(k) for k in ('sender', 'recipient', 'text'))
@@ -95,7 +102,7 @@ class Broker:
             raise ValueError('text must contain 1 to 4000 characters')
         with closing(self.connect()) as db, db:
             known = {r['id'] for r in db.execute(
-                'SELECT id FROM sessions WHERE id IN (?, ?)', (sender, recipient))}
+                'SELECT id FROM sessions WHERE opted_in=1 AND id IN (?, ?)', (sender, recipient))}
             if sender not in known or recipient not in known:
                 raise ValueError('sender and recipient must be registered')
             requested = data.get('id')
@@ -152,7 +159,7 @@ class Broker:
         with closing(self.connect()) as db, db:
             db.execute('BEGIN IMMEDIATE')
             known = {row['id'] for row in db.execute(
-                f'SELECT id FROM sessions WHERE id IN ({all_placeholders})', all_ids)}
+                f'SELECT id FROM sessions WHERE opted_in=1 AND id IN ({all_placeholders})', all_ids)}
             if sender not in known:
                 raise ValueError('sender must be registered')
             missing = [recipient for recipient in ordered_recipients if recipient not in known]
@@ -208,11 +215,12 @@ class Broker:
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError('invalid page cursor')
         with closing(self.connect()) as db, db:
-            if not db.execute('SELECT 1 FROM sessions WHERE id=?', (recipient,)).fetchone():
-                raise ValueError('recipient is not registered')
+            if not db.execute('SELECT 1 FROM sessions WHERE id=? AND opted_in=1', (recipient,)).fetchone():
+                raise ValueError('recipient has not opted in')
             rows = [dict(row) for row in db.execute(
-                'SELECT seq,id,sender,recipient,text,status,created,acknowledged '
-                'FROM messages WHERE recipient=? AND seq>? ORDER BY seq LIMIT 1000', (recipient, after))]
+                'SELECT m.seq,m.id,m.sender,m.recipient,m.text,m.status,m.created,m.acknowledged '
+                'FROM messages m JOIN sessions s ON s.id=m.sender AND s.opted_in=1 '
+                'WHERE m.recipient=? AND m.seq>? ORDER BY m.seq LIMIT 1000', (recipient, after))]
             return {'messages': rows, 'next_after': rows[-1]['seq'] if len(rows) == 1000 else None}
 
     def ack(self, data):

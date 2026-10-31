@@ -1,6 +1,5 @@
 param(
     [string]$ClaudeSessionId,
-    [string]$CodexSessionId = '01a18ed9-5766-7ef1-9328-67ed7465809a',
     [string]$Model,
     [ValidateSet('low','medium','high','xhigh','max')][string]$Effort,
     [switch]$PrepareOnly,
@@ -9,12 +8,10 @@ param(
 )
 
 $claudeGuid = [Guid]::Empty
-$codexGuid = [Guid]::Empty
 $resume = -not [string]::IsNullOrWhiteSpace($ClaudeSessionId)
 if (-not $resume) { $ClaudeSessionId = [Guid]::NewGuid().ToString() }
-if (-not [Guid]::TryParse($ClaudeSessionId, [ref]$claudeGuid) -or
-    -not [Guid]::TryParse($CodexSessionId, [ref]$codexGuid)) {
-    throw 'Session IDs must be UUIDs.'
+if (-not [Guid]::TryParse($ClaudeSessionId, [ref]$claudeGuid)) {
+    throw 'The Claude session ID must be a UUID.'
 }
 $state = Join-Path $PSScriptRoot 'broker-session.json'
 if (-not $PrepareOnly -or $CheckServices) {
@@ -42,27 +39,6 @@ if (-not $PrepareOnly -or $CheckServices) {
         }
         if (-not $ready) { throw 'The bridge broker could not be started.' }
     }
-    & $python -B $client register --id $CodexSessionId --kind codex *> $null
-    if ($LASTEXITCODE -ne 0) { throw 'The destination Codex session could not be registered.' }
-    $workerState = Join-Path $PSScriptRoot "native-worker-$CodexSessionId.json"
-    $workerRunning = $false
-    if (Test-Path -LiteralPath $workerState) {
-        try {
-            $worker = Get-Content -LiteralPath $workerState -Raw | ConvertFrom-Json
-            $workerPid = [int]$worker.pid
-            $process = Get-CimInstance Win32_Process -Filter "ProcessId = $workerPid"
-            if ($process) {
-                if ($process.CommandLine -notlike "*native_worker.py*$CodexSessionId*") {
-                    throw 'The worker process cannot safely be verified.'
-                }
-                $workerRunning = $true
-            }
-        } catch { throw 'The Codex bridge worker state could not be safely verified.' }
-    }
-    if (-not $workerRunning) {
-        $workerArgs = @('-B', (Join-Path $PSScriptRoot 'native_worker.py'), '--recipient', $CodexSessionId)
-        Start-Process -FilePath $python -ArgumentList $workerArgs -WorkingDirectory $PSScriptRoot -WindowStyle Hidden | Out-Null
-    }
 }
 $existing = Get-CimInstance Win32_Process -Filter "name = 'claude.exe'" |
     Where-Object { $_.CommandLine -like "*$ClaudeSessionId*" }
@@ -73,8 +49,7 @@ $server = @{
     mcpServers = @{
         'agent-bridge' = @{
             command = 'C:\Program Files\Python310\python.exe'
-            args = @((Join-Path $PSScriptRoot 'claude_adapter.py'), '--session-id',
-                $ClaudeSessionId, '--codex-id', $CodexSessionId)
+            args = @((Join-Path $PSScriptRoot 'claude_adapter.py'), '--session-id', $ClaudeSessionId)
         }
     }
 }

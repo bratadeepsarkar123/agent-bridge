@@ -26,6 +26,15 @@ workspace private, do not share that file, and do not expose the listener. All
 local clients with that token share authority, so sender names are labels, not
 cryptographically verified identities. Registration is not an online signal.
 
+In this routing branch, registration is an explicit participation opt-in. Legacy
+registrations are not automatically trusted on database migration: each session
+must opt in again, and old queued messages remain hidden until their sender and
+recipient have opted in. Each send names its destination; launching Claude does
+not register another session or start its native delivery worker. The shared
+bearer token does not authenticate the claimed session identity, so opt-in relies
+on trusted local clients. Queued messages still do not establish delivery or
+whether a session is online.
+
 The broker currently runs as a background process. A supervisor watches for a
 broker crash and attempts to recover the same port and token. It does not restart
 Claude, recover an intentionally stopped broker, or start after a machine reboot.

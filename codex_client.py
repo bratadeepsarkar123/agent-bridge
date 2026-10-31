@@ -137,7 +137,7 @@ class BrokerClient:
         self._require_id(session_id, "id")
         if kind not in {"codex", "claude", "system"}:
             raise ClientError("invalid_argument", "kind must be codex, claude, or system")
-        return self._request("POST", "/v1/register", {"id": session_id, "kind": kind})
+        return self._request("POST", "/v1/register", {"id": session_id, "kind": kind, "opt_in": True})
 
     def discover(self) -> Any:
         return self._request("GET", "/v1/sessions")

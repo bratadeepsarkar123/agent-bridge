@@ -11,15 +11,90 @@ from broker import Broker, handler_for
 from claude_adapter import BrokerClient as ClaudeBrokerClient, ClaudeAdapter
 from codex_client import BrokerClient as CodexBrokerClient
 from codex_mcp import respond
+from codex_queue import DeliveryLedger
+from native_worker import drain_once
 
 
 class IntegrationTest(unittest.TestCase):
+    def test_two_simulated_loaded_codex_threads_receive_only_their_messages(self):
+        a = '123e4567-e89b-12d3-a456-426614174000'
+        b = '123e4567-e89b-12d3-a456-426614174001'
+        events = []
+
+        class LoadedProxy:
+            def request(self, method, params, timeout):
+                if method == 'thread/read':
+                    return {'thread': {'id': params['threadId'], 'status': {'type': 'idle'}}}
+                if method == 'turn/start':
+                    events.append((params['threadId'], json.loads(params['toolOutput']['output'])['text']))
+                    return {'turn': {'id': 'simulated'}}
+                raise AssertionError(method)
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            broker = Broker(root / 'queue.sqlite3')
+            http = ThreadingHTTPServer(('127.0.0.1', 0), handler_for(broker, 'token'))
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            try:
+                state = root / 'session.json'
+                state.write_text(json.dumps({'port': http.server_port, 'token': 'token'}), encoding='utf-8')
+                client = CodexBrokerClient(state)
+                client.register('sender', 'claude')
+                client.register(a, 'codex')
+                client.register(b, 'codex')
+                client.send('sender', a, 'only A')
+                client.send('sender', b, 'only B')
+                ledger = DeliveryLedger(root / 'delivery.sqlite3')
+                self.assertEqual('submitted', drain_once(a, client, ledger, LoadedProxy)[0]['status'])
+                self.assertEqual('submitted', drain_once(b, client, ledger, LoadedProxy)[0]['status'])
+                self.assertEqual([(a, 'only A'), (b, 'only B')], events)
+            finally:
+                http.shutdown()
+                http.server_close()
+                thread.join()
+
+    def test_two_opted_in_adapters_receive_only_named_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            broker = Broker(root / 'queue.sqlite3')
+            http = ThreadingHTTPServer(('127.0.0.1', 0), handler_for(broker, 'token'))
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            try:
+                state = root / 'session.json'
+                state.write_text(json.dumps({'port': http.server_port, 'token': 'token'}), encoding='utf-8')
+                codex = CodexBrokerClient(state)
+                claude = ClaudeBrokerClient(state)
+                codex.register('sender', 'codex')
+                for name in ('claude-a', 'claude-b', 'claude-other'):
+                    claude.register(name)
+                outputs = {name: io.StringIO() for name in ('claude-a', 'claude-b', 'claude-other')}
+                adapters = {name: ClaudeAdapter(name, 'sender', claude, stdout=out)
+                            for name, out in outputs.items()}
+                codex.send('sender', 'claude-a', 'only A')
+                codex.send('sender', 'claude-b', 'only B')
+                for name, adapter in adapters.items():
+                    # Even if the input is accidentally mixed, each adapter rejects other recipients.
+                    combined = claude.messages('claude-a')['messages'] + claude.messages('claude-b')['messages']
+                    adapter.deliver_messages(combined)
+                self.assertEqual('only A', json.loads(outputs['claude-a'].getvalue())['params']['content'])
+                self.assertEqual('only B', json.loads(outputs['claude-b'].getvalue())['params']['content'])
+                self.assertEqual('', outputs['claude-other'].getvalue())
+            finally:
+                http.shutdown()
+                http.server_close()
+                thread.join()
+
     def test_inbox_paginates_beyond_one_thousand(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             broker = Broker(root / 'queue.sqlite3')
-            broker.register({'id': 'codex-test', 'kind': 'codex'})
-            broker.register({'id': 'claude-test', 'kind': 'claude'})
+            broker.register({'id': 'codex-test', 'kind': 'codex', 'opt_in': True})
+            broker.register({'id': 'claude-test', 'kind': 'claude', 'opt_in': True})
             with closing(broker.connect()) as db, db:
                 db.executemany('INSERT INTO messages(id,sender,recipient,text,status,created) VALUES (?,?,?,?,?,?)',
                                [(str(i), 'claude-test', 'codex-test', str(i), 'queued', 0) for i in range(1001)])
@@ -87,7 +162,7 @@ class IntegrationTest(unittest.TestCase):
                 self.assertEqual(1, len(output.getvalue().splitlines()))
                 result = adapter.call_tool({'name': 'bridge_ack', 'arguments': {'message_id': outbound['id']}})
                 self.assertNotIn('isError', result)
-                reply = adapter.call_tool({'name': 'bridge_send', 'arguments': {'text': 'Hello Codex'}})
+                reply = adapter.call_tool({'name': 'bridge_send', 'arguments': {'text': 'Hello Codex', 'recipient': 'codex-test'}})
                 self.assertNotIn('isError', reply)
                 inbox = codex.poll('codex-test')['messages']
                 self.assertEqual('Hello Codex', inbox[0]['text'])
