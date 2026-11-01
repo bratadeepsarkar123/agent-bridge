@@ -207,3 +207,8 @@ python -B -m unittest -v tests.test_mcp_appserver_e2e
 ```
 
 It starts no chats and uses no model inference.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
+
