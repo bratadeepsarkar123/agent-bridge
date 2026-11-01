@@ -1,7 +1,8 @@
 # Bridge candidate review
 
 This is a review copy, not a release. The branch is `bridge/integrated-plan`,
-based on `f57d010`; changes and new files are uncommitted. There is no push.
+based on `f57d010`; the candidate is committed as `4b710bf`. This public repo
+has no release tag and no live deployment.
 
 The existing live two-chat experiment previously showed an exchange between the
 authorized Claude and Codex sessions. This review copy is a separate worktree;
@@ -46,10 +47,9 @@ this run. The app-server check does not exercise a real chat or prove idle wake.
 
 ## Commit and rollback
 
-A future commit would need an explicit review of the source, tests and docs
-listed below. The modified tracked `tests/__pycache__/test_codex_client.cpython-310.pyc`
-is a generated artifact and should not be included without a separate reason.
-No files have been staged by this review.
+The candidate is committed as `4b710bf`. The modified tracked
+`tests/__pycache__/test_codex_client.cpython-310.pyc` is a generated artifact and is
+not part of the candidate; leave it out of any commit.
 
 The live experiment was not switched to this worktree, so no live rollback was
 performed. A clean rollback of a future live upgrade is **not proven**: the old
