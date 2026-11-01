@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from service_guard import check_once, save_config
+from service_guard import check_once, save_config, validate_service
 
 
 class ServiceGuardTests(unittest.TestCase):
@@ -23,6 +23,32 @@ class ServiceGuardTests(unittest.TestCase):
         self.assertEqual('start_requested', events[0]['status'])
         self.assertEqual(456, service['pid'])
         self.assertIn('watch_session.py', popen.call_args.args[0][2])
+
+    def test_multi_dispatcher_is_an_allowed_service(self):
+        service = {
+            'script': 'multi_dispatcher.py',
+            'args': ['--recipient', 'thread-a', '--recipient', 'thread-b'],
+            'pid': 123,
+            'creation': 99,
+        }
+        validate_service(service)
+
+    def test_dead_multi_dispatcher_is_restarted_with_configured_recipients(self):
+        service = {
+            'script': 'multi_dispatcher.py',
+            'args': ['--recipient', 'thread-a', '--recipient', 'thread-b'],
+            'pid': 123,
+            'creation': 99,
+        }
+        popen = Mock(return_value=SimpleNamespace(pid=456))
+        with patch('status._process_is_alive', return_value=False):
+            events = check_once([service], identify=lambda pid: 101 if pid == 456 else None, popen=popen)
+
+        command = popen.call_args.args[0]
+        self.assertEqual('multi_dispatcher.py', Path(command[2]).name)
+        self.assertEqual(service['args'], command[3:])
+        self.assertEqual('start_requested', events[0]['status'])
+        self.assertEqual(456, service['pid'])
 
     def test_unknown_identity_does_not_spawn_duplicate(self):
         service = {'script': 'supervisor.py', 'args': [], 'pid': 123, 'creation': 99}

@@ -1,11 +1,12 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from codex_queue import DeliveryLedger
 from codex_native import RPCRejected, ProxyError
-from native_worker import drain_once
+import native_worker
+from native_worker import drain_once, start_holder
 
 THREAD = '123e4567-e89b-12d3-a456-426614174000'
 MESSAGE = '987e6543-e21b-12d3-a456-426614174000'
@@ -19,6 +20,26 @@ class NativeWorkerTests(unittest.TestCase):
         self.broker = Mock()
         self.broker.poll.return_value = {'messages': [{'id': MESSAGE, 'recipient': THREAD,
             'sender': 'claude-test', 'text': 'hello', 'status': 'queued'}]}
+
+    def test_holder_is_only_started_for_explicit_opt_in(self):
+        factory, proxy_factory = Mock(), Mock()
+        self.assertIsNone(start_holder(THREAD, False, factory, proxy_factory))
+        factory.assert_not_called()
+        holder = start_holder(THREAD, True, factory, proxy_factory)
+        factory.assert_called_once_with(proxy_factory, THREAD)
+        holder.connect.assert_called_once_with(resume=True)
+
+    def test_worker_does_not_register_or_opt_in_its_recipient(self):
+        broker = Mock()
+        broker.wait_for_messages.side_effect = KeyboardInterrupt
+        with patch('sys.argv', ['native_worker.py', '--recipient', THREAD]), \
+             patch.object(native_worker, 'acquire'), patch.object(native_worker, 'release'), \
+             patch.object(native_worker, 'BrokerClient', return_value=broker), \
+             patch.object(native_worker, 'DeliveryLedger'), \
+             patch.object(native_worker, 'drain_once', return_value=[]):
+            with self.assertRaises(KeyboardInterrupt):
+                native_worker.main()
+        broker.register.assert_not_called()
 
     def test_waits_for_approval_without_claiming_or_sending(self):
         proxy = Mock()

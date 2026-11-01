@@ -12,6 +12,7 @@ from pathlib import Path
 
 from status import _process_is_alive
 from lockfile import acquire, release
+from broker import require_recovery_allowed
 
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / 'broker-session.json'
@@ -26,6 +27,7 @@ def log(message):
 
 def inspect_broker():
     try:
+        require_recovery_allowed(STATE)
         state = json.loads(STATE.read_text(encoding='utf-8'))
         pid = state['pid']
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
@@ -33,6 +35,8 @@ def inspect_broker():
         return 'running' if _process_is_alive(pid) else 'crashed'
     except FileNotFoundError:
         return 'stopped'
+    except RuntimeError:
+        return 'stop_pending'
     except (OSError, ValueError, KeyError, TypeError):
         return 'invalid'
 
@@ -53,6 +57,10 @@ def run():
                 # broker.py verifies that the old PID is absent and binds the
                 # original port before claiming the stale discovery file.
                 try:
+                    # Optimization only: broker --recover rechecks under the
+                    # recovery gate, closing the check-to-launch race. Never
+                    # clear an inhibit here, including malformed/stale markers.
+                    require_recovery_allowed(STATE)
                     child = subprocess.Popen([sys.executable, '-B', str(ROOT / 'broker.py'), '--recover'],
                                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                              stderr=subprocess.DEVNULL,
@@ -60,6 +68,8 @@ def run():
                     time.sleep(3)
                     if child.poll() is not None:
                         log('broker recovery failed; will retry later')
+                except RuntimeError:
+                    log('broker recovery inhibited; operator review required')
                 except OSError:
                     log('broker recovery could not launch; will retry later')
                 time.sleep(27)

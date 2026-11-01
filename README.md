@@ -20,6 +20,54 @@ universal live-chat connection.
 
 ## Runtime
 
+This worktree integrates explicit session opt-in, event-driven notifications,
+and named rooms with reply-all. The live experiment does not automatically use
+this worktree. A legacy registration without `opt_in` is accepted only as a
+heartbeat for a session already opted in under the same ID and kind. Registration
+and room membership are routing controls, not authenticated sender identities.
+The bounded long-poll endpoint lets consumers wait without repeated short polls;
+`multi_dispatcher.py` can serve multiple explicitly opted-in Codex threads in
+one process. Existing workers for those threads must stop before it starts.
+By default, closed chats are not reopened automatically.
+
+For a specifically authorized thread, `native_worker.py --recipient <thread-id>
+--keep-loaded` explicitly permits resuming that thread and keeps a dedicated
+app-server subscription open. Reconnects may resume the same saved thread; a
+missing rollout is reported unavailable and never replaced with a new thread.
+This opt-in mode uses an additional proxy process per recipient and has not been
+live-tested. The default worker does not resume unloaded threads. Pending human
+approval remains a separate concern; the holder never responds to approval
+requests.
+
+For several explicitly opted-in Codex threads, `multi_dispatcher.py` accepts
+repeated `--recipient` arguments. Its optional `--keep-loaded` flag shares one
+app-server subscription connection across the selected threads; the flag may
+resume those exact saved threads. This mode is tested with simulated app-server
+traffic and has not been activated for live chats.
+
+`message_status.py --recipient <thread-id> --id <message-id>` reports broker
+acknowledgement separately from Codex submission. Submission is not proof of
+handling or reply. `measure_resources.ps1` samples helper CPU and memory on
+Windows; pass `-ProjectPath` to measure a different bridge checkout.
+
+The broker also supports optional scoped profile credentials. A credential can
+be provisioned only by trusted local code; the broker stores its hash and rejects
+claims on that protected profile from legacy or differently scoped clients.
+Clients may read the credential from `BRIDGE_SESSION_CREDENTIAL_FILE`; a pooled
+dispatcher can instead use repeated `--credential <session-id>=<file>` arguments.
+On Windows, trusted local code can use `credential_store.provision_initial_profile`
+to create a user-bound DPAPI encrypted credential and bind its hash to a profile.
+The caller must supply a private directory with restrictive Windows ACLs. Set
+`BRIDGE_SESSION_CREDENTIAL_FORMAT=dpapi` when reading that encrypted file.
+Automatic assignment to chats and credential rotation are not implemented.
+A credential identifies a configured profile, not an independently verified
+Codex thread, and it does not protect against software running as the same OS
+user. Existing unprotected participants retain legacy shared-token behavior.
+
+The broker CLI rejects an existing older schema by default; a planned migration
+requires `--allow-legacy-migration`. This schema check cannot detect an old
+snapshot that already has the current schema or prove a backup is complete.
+
 `broker.py` runs on loopback and stores registered session IDs and messages in
 `broker.sqlite3`. `broker-session.json` contains a bearer token and port: keep the
 workspace private, do not share that file, and do not expose the listener. All
@@ -42,6 +90,30 @@ New adapter versions read the current discovery file again on each request.
 The local service guard watches the broker supervisor, native Codex worker, and
 the two monitoring workers; it restarts those services if they stop. It never
 starts or restarts an agent chat. The guard itself does not start after reboot.
+
+`broker.py --control-stdin` has an isolated cooperative HTTP drain for a launcher-
+owned private pipe. It first publishes a flushed recovery-inhibit marker, then
+`stop` or pipe EOF closes application admission, rejects new requests with 503,
+and waits up to `--drain-timeout` for tracked handlers. Once marker publication
+succeeds, the supervisor's recovery path is fenced while that marker remains,
+including after a failed drain. If marker publication fails, drain is refused;
+if the broker then exits with discovery state retained and no marker, the
+supervisor may still treat it as a crash and auto-recover. That publication
+failure remains a rollout blocker. A failed drain reports failure and retains
+state and marker; it does not perform a second drain wait. Non-daemon handlers
+can keep the broker process alive until they finish. A successful drain removes
+discovery state and the marker, though final bounded server/process cleanup may
+still be needed. The listener remains open during the wait, so new connections
+can still arrive and be rejected and may delay completion. Focused isolated tests
+cover an admitted long poll, a short POST body, slow-trickling headers with a
+1-second hard deadline, startup EOF, pipe EOF, blocked work, rejection of new
+requests, failed-drain behavior, and the recovery fence. These tests do not
+establish a coordinated live stop/restart mechanism. A sustained stream of new
+arrivals is not tested and may delay shutdown. Marker publication does not
+guarantee that Windows directory metadata survives power loss or rollback.
+
+`lifecycle_intent_prototype.py` tests supervisor-owned stop intent using only
+synthetic child processes. It is not connected to the live broker or launcher.
 
 `launch-claude.ps1` is an opt-in launcher that creates a new Claude session when
 no Claude ID is given, or resumes an explicit stopped session ID. It merges its
@@ -105,15 +177,33 @@ closed chats, or general-purpose monitoring yet. Only the one Claude and one Cod
 have been tested live for the Claude-to-Codex bridge; multi-recipient routing
 has been tested locally with simulated sessions.
 
-The source includes an explicit-recipient group fan-out endpoint. It stores one
-message and acknowledgement per recipient atomically, and a caller-supplied batch
-UUID makes retries idempotent. This is fan-out, not yet a shared group conversation:
-recipients do not automatically receive a membership list or reply-all route. The
-currently running broker predates this endpoint; it becomes available on a later
-broker restart. Existing sessions may also need their adapters reloaded to expose
-new tools.
+The broker, Codex Python client, CLI (`--message-id`), and Codex and Claude
+`bridge_send` MCP tools support an optional caller-supplied stable canonical UUID.
+Reuse the same UUID with the same sender, recipient, text, and `reply_to` on a
+retry; the broker returns the existing message for identical content and rejects
+reuse with different content. If a send omits the UUID, the broker generates a
+new one, so retrying after an
+uncertain response can enqueue a duplicate; no-ID sends are not retry-safe.
+
+Named rooms provide explicit membership and reply-all, using an atomic message
+and acknowledgement per recipient. Batch UUIDs make retries idempotent. Five
+simulated participants have been tested; live multi-session delivery has not.
+The running broker and adapters predate these features and need an appropriate
+upgrade or reload before they become available in existing chats.
 
 ## Checks
 
-Run `python -B -m unittest -v test_broker test_claude_adapter test_integration tests.test_codex_client tests.test_status tests.test_monitor tests.test_codex_queue tests.test_supervisor tests.test_watch_session tests.test_watch_errors tests.test_codex_native tests.test_native_worker tests.test_codex_mcp tests.test_lockfile tests.test_service_guard`
+Run `python -B -m unittest -v test_broker test_claude_adapter test_integration tests.test_codex_client tests.test_status tests.test_monitor tests.test_codex_queue tests.test_supervisor tests.test_watch_session tests.test_watch_errors tests.test_codex_native tests.test_native_worker tests.test_codex_mcp tests.test_lockfile tests.test_service_guard tests.test_message_status tests.test_multi_dispatcher tests.test_persistent_subscription tests.test_shared_subscription tests.test_app_server_proxy_transport tests.test_mcp_stdio_subprocess tests.test_rollback_rehearsal tests.test_session_credentials tests.test_credential_store tests.test_scoped_e2e tests.test_redirect_security tests.test_sqlite_backup_restore_rehearsal tests.test_startup_schema_guard tests.test_stop_helper tests.test_synthetic_stop tests.test_backup_writer_fence tests.test_dpapi_backup_restore_rehearsal tests.test_broker_cooperative_stop tests.test_broker_http_drain tests.test_broker_slow_shutdown tests.test_broker_startup_shutdown tests.test_broker_long_poll_shutdown tests.test_direct_retry_conflicts tests.test_direct_retry_persistence tests.test_snapshot_freshness tests.test_stop_recovery_fence`
 from this directory. These tests use isolated local data and no model inference.
+
+Also run `python -B -m unittest -v tests.test_lifecycle_intent_prototype tests.test_lifecycle_policy tests.test_client_lost_send_response`
+for the isolated lifecycle policy, prototype and lost-response client checks.
+
+For the optional Windows encoding regression against a real isolated app-server:
+
+```powershell
+$env:BRIDGE_RUN_APP_SERVER_E2E='1'
+python -B -m unittest -v tests.test_mcp_appserver_e2e
+```
+
+It starts no chats and uses no model inference.

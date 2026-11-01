@@ -12,13 +12,26 @@ from codex_client import BrokerClient, ClientError
 from codex_native import AppServerProxy, ProxyError, RPCRejected, TargetUnavailable, deliver_message
 from codex_queue import DeliveryLedger, QueueError, canonical_uuid
 from lockfile import acquire, release
+from persistent_subscription import PersistentSubscription
 
 ROOT = Path(__file__).resolve().parent
 
 
+def start_holder(recipient, enabled, holder_factory=PersistentSubscription, proxy_factory=AppServerProxy):
+    """Start a holder only after the operator explicitly opts this thread in."""
+    if not enabled:
+        return None
+    holder = holder_factory(proxy_factory, recipient)
+    try:
+        holder.connect(resume=True)
+    except (ProxyError, OSError) as exc:
+        print(json.dumps({'status': 'subscription_unavailable', 'error_type': type(exc).__name__}), flush=True)
+    return holder
+
+
 def drain_once(recipient, broker, ledger, proxy_factory=AppServerProxy, idle_only=False):
     recipient = canonical_uuid(recipient, 'recipient')
-    messages = broker.poll(recipient).get('messages', [])
+    messages = broker.poll(recipient, status='queued').get('messages', [])
     if not isinstance(messages, list):
         raise ValueError('invalid broker response')
     results = []
@@ -68,6 +81,8 @@ def main():
     parser.add_argument('--recipient', required=True)
     parser.add_argument('--interval', type=int, default=10)
     parser.add_argument('--idle-only', action='store_true', help='hold messages while the target is active')
+    parser.add_argument('--keep-loaded', action='store_true',
+                        help='explicitly permit resuming this thread and keeping a subscription open')
     args = parser.parse_args()
     recipient = canonical_uuid(args.recipient, 'recipient')
     if args.interval < 5:
@@ -80,8 +95,16 @@ def main():
     try:
         broker = BrokerClient()
         ledger = DeliveryLedger(ROOT / 'codex-native-ledger.sqlite3')
+        holder = start_holder(recipient, args.keep_loaded)
         previous = None
+        holder_previous = None
+        cursor = 0
         while True:
+            results = []
+            if holder is not None and holder.status != holder_previous:
+                holder_previous = holder.status
+                print(json.dumps({'status': 'subscription_' + holder.status,
+                                  'error_type': type(holder.last_error).__name__ if holder.last_error else None}), flush=True)
             try:
                 results = drain_once(recipient, broker, ledger, idle_only=args.idle_only)
                 report = json.dumps(results, sort_keys=True)
@@ -93,8 +116,21 @@ def main():
                 if report != previous:
                     print(json.dumps({'status': 'worker_error', 'error_type': report}), flush=True)
                 previous = report
-            time.sleep(args.interval)
+            try:
+                # A target awaiting a human decision needs periodic rechecks;
+                # otherwise wait for the broker to signal a new message.
+                pending = any(item.get('status') == 'waiting_for_target' for item in results)
+                wait = broker.wait_for_messages(recipient, cursor, min(args.interval, 25) if pending else 25)
+                new_cursor = wait.get('cursor')
+                if isinstance(new_cursor, bool) or not isinstance(new_cursor, int) or new_cursor < cursor:
+                    raise ValueError('invalid broker cursor')
+                cursor = new_cursor
+            except (ClientError, OSError, ValueError):
+                # Older brokers do not expose the wait endpoint yet.
+                time.sleep(args.interval)
     finally:
+        if 'holder' in locals() and holder is not None:
+            holder.close()
         release(lock)
 
 

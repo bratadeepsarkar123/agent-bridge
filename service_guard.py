@@ -13,7 +13,13 @@ from lockfile import acquire, release
 
 ROOT = Path(__file__).resolve().parent
 LOCK = ROOT / 'service-guard.json'
-ALLOWED = {'native_worker.py', 'watch_session.py', 'watch_errors.py', 'supervisor.py'}
+ALLOWED = {
+    'native_worker.py',
+    'watch_session.py',
+    'watch_errors.py',
+    'supervisor.py',
+    'multi_dispatcher.py',
+}
 
 
 def process_identity(pid):

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.sqlite3*
+*.log
+*.ndjson
+*.dpapi
+*.token
+*-session.json
+service-guard*.json
+native-worker-*.json*
+mcp-*.json
+mcp.json
+worker-current-pid.txt

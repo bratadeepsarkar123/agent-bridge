@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -12,10 +14,38 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import credential_store
+
 
 DISCOVERY_FILE = Path(__file__).with_name("broker-session.json")
+SESSION_CREDENTIAL_FILE_ENV = "BRIDGE_SESSION_CREDENTIAL_FILE"
+SESSION_CREDENTIAL_FORMAT_ENV = "BRIDGE_SESSION_CREDENTIAL_FORMAT"
+SESSION_CREDENTIAL_RE = re.compile(r"[A-Za-z0-9_-]{32,512}\Z")
 DEFAULT_TIMEOUT = 10.0
 MAX_GROUP_RECIPIENTS = 100
+MAX_ROOM_MEMBERS = 100
+MAX_ROOM_NAME = 120
+MAX_ROOM_MESSAGE_LENGTH = 4000
+ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_BROKER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+def _open_broker(request, timeout):
+    return _BROKER_OPENER.open(request, timeout=timeout)
+
+
+class _UseEnvironmentCredentialFile:
+    """Sentinel for resolving the credential file from the environment per request."""
+
+
+_USE_ENVIRONMENT_CREDENTIAL_FILE = _UseEnvironmentCredentialFile()
 
 
 class ClientError(Exception):
@@ -54,9 +84,68 @@ class BrokerClient:
         self,
         discovery_file: Path = DISCOVERY_FILE,
         timeout: float = DEFAULT_TIMEOUT,
+        credential_file: str | Path | None | _UseEnvironmentCredentialFile = (
+            _USE_ENVIRONMENT_CREDENTIAL_FILE
+        ),
     ) -> None:
         self.discovery_file = Path(discovery_file)
         self.timeout = timeout
+        self.credential_file = credential_file
+
+    @staticmethod
+    def _read_session_credential(path: str) -> str:
+        if not path.strip():
+            raise ClientError(
+                "session_credential_file_invalid",
+                "Scoped session credential file path is empty",
+            )
+        try:
+            with Path(path).open(encoding="utf-8") as stream:
+                contents = stream.read(514)
+        except FileNotFoundError:
+            raise ClientError(
+                "session_credential_file_missing",
+                "Scoped session credential file is missing",
+            ) from None
+        except (OSError, UnicodeError, TypeError, ValueError):
+            raise ClientError(
+                "session_credential_file_invalid",
+                "Could not read scoped session credential file",
+            ) from None
+
+        # Permit a single conventional final line ending, but otherwise require
+        # the file to contain exactly one raw URL-safe token.
+        if contents.endswith("\n"):
+            contents = contents[:-1]
+        elif contents.endswith("\r"):
+            contents = contents[:-1]
+        if not contents or not SESSION_CREDENTIAL_RE.fullmatch(contents):
+            raise ClientError(
+                "session_credential_file_invalid",
+                "Scoped session credential file must contain one raw URL-safe token",
+            )
+        return contents
+
+    @staticmethod
+    def _read_dpapi_session_credential(path: str | Path) -> str:
+        try:
+            token = credential_store.read_generation(path)
+            if not isinstance(token, bytes):
+                raise TypeError
+            decoded = token.decode("ascii")
+        except Exception:
+            # Credential store failures may contain implementation details; keep
+            # all scoped-file errors sanitized and never include credential data.
+            raise ClientError(
+                "session_credential_file_invalid",
+                "Could not read scoped session credential file",
+            ) from None
+        if not SESSION_CREDENTIAL_RE.fullmatch(decoded):
+            raise ClientError(
+                "session_credential_file_invalid",
+                "Scoped session credential file must contain one raw URL-safe token",
+            )
+        return decoded
 
     def _broker_config(self) -> tuple[str, str]:
         try:
@@ -76,11 +165,42 @@ class BrokerClient:
             raise ClientError("discovery_file_invalid", "Broker discovery data must be a JSON object")
 
         port = config.get("port")
-        token = config.get("token")
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise ClientError("discovery_file_invalid", "Broker discovery data has an invalid port")
-        if not isinstance(token, str) or not token:
-            raise ClientError("discovery_file_invalid", "Broker discovery data has an invalid token")
+
+        use_environment = self.credential_file is _USE_ENVIRONMENT_CREDENTIAL_FILE
+        credential_file = self.credential_file
+        if use_environment:
+            credential_file = os.environ.get(SESSION_CREDENTIAL_FILE_ENV)
+
+        # Explicit None opts out of both scoped-file environment settings.
+        if credential_file is None and not use_environment:
+            token = config.get("token")
+            if not isinstance(token, str) or not token:
+                raise ClientError("discovery_file_invalid", "Broker discovery data has an invalid token")
+        else:
+            credential_format = os.environ.get(SESSION_CREDENTIAL_FORMAT_ENV, "plaintext")
+            if credential_format not in {"plaintext", "dpapi"}:
+                raise ClientError(
+                    "session_credential_format_invalid",
+                    "Scoped session credential format is unsupported",
+                )
+            if credential_file is None:
+                if credential_format == "dpapi":
+                    raise ClientError(
+                        "session_credential_file_missing",
+                        "DPAPI credential format requires a scoped credential file",
+                    )
+                token = config.get("token")
+                if not isinstance(token, str) or not token:
+                    raise ClientError(
+                        "discovery_file_invalid",
+                        "Broker discovery data has an invalid token",
+                    )
+            elif credential_format == "dpapi":
+                token = self._read_dpapi_session_credential(credential_file)
+            else:
+                token = self._read_session_credential(os.fspath(credential_file))
 
         return f"http://127.0.0.1:{port}", token
 
@@ -89,6 +209,7 @@ class BrokerClient:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         base_url, token = self._broker_config()
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -101,7 +222,7 @@ class BrokerClient:
         request = urllib.request.Request(f"{base_url}{path}", data=data, headers=headers, method=method)
 
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with _open_broker(request, timeout=self.timeout if timeout is None else timeout) as response:
                 status = response.getcode()
                 raw = response.read()
         except urllib.error.HTTPError as exc:
@@ -133,23 +254,77 @@ class BrokerClient:
         if not isinstance(value, str) or not value.strip():
             raise ClientError("invalid_argument", f"{name} must be a nonempty string")
 
+    @staticmethod
+    def _require_room_id(value: str, name: str) -> None:
+        if not isinstance(value, str) or not ID_RE.fullmatch(value):
+            raise ClientError("invalid_argument", f"{name} must be a valid ID")
+
+    @staticmethod
+    def _require_batch_id(batch_id: str) -> None:
+        if not isinstance(batch_id, str):
+            raise ClientError("invalid_argument", "batch_id must be a canonical UUID")
+        try:
+            parsed_batch_id = uuid.UUID(batch_id)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ClientError("invalid_argument", "batch_id must be a canonical UUID") from exc
+        if str(parsed_batch_id) != batch_id:
+            raise ClientError("invalid_argument", "batch_id must be a canonical UUID")
+
     def register(self, session_id: str, kind: str) -> Any:
         self._require_id(session_id, "id")
         if kind not in {"codex", "claude", "system"}:
             raise ClientError("invalid_argument", "kind must be codex, claude, or system")
-        return self._request("POST", "/v1/register", {"id": session_id, "kind": kind, "opt_in": True})
+        return self._request(
+            "POST",
+            "/v1/register",
+            {"id": session_id, "kind": kind, "opt_in": True},
+        )
 
     def discover(self) -> Any:
         return self._request("GET", "/v1/sessions")
 
-    def send(self, sender: str, recipient: str, text: str, message_id: str | None = None) -> Any:
+    def check_session(self, session_id: str) -> Any:
+        """Verify this client's credential can act as one opted-in session."""
+        self._require_id(session_id, "session_id")
+        return self._request("GET", "/v1/sessions/check?" + urllib.parse.urlencode({"id": session_id}))
+
+    def wait_for_messages(self, recipient: str, after: int, timeout: float = 25) -> Any:
+        """Wait for newly queued messages; the cursor prevents repeated delivery."""
+        self._require_id(recipient, "recipient")
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ClientError("invalid_argument", "after must be a nonnegative integer")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 <= timeout <= 25:
+            raise ClientError("invalid_argument", "timeout must be between 0 and 25 seconds")
+        query = urllib.parse.urlencode({"recipient": recipient, "after": after, "timeout": timeout})
+        return self._request("GET", "/v1/messages/wait?" + query, timeout=self.timeout + timeout)
+
+    def send(
+        self,
+        sender: str,
+        recipient: str,
+        text: str,
+        message_id: str | None = None,
+        reply_to: str | None = None,
+    ) -> Any:
         self._require_id(sender, "sender")
         self._require_id(recipient, "recipient")
         if not isinstance(text, str) or not text.strip():
             raise ClientError("invalid_argument", "text must be a nonempty string")
         payload = {"sender": sender, "recipient": recipient, "text": text}
         if message_id is not None:
+            if not isinstance(message_id, str):
+                raise ClientError("invalid_argument", "message_id must be a canonical UUID")
+            try:
+                parsed_message_id = uuid.UUID(message_id)
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ClientError("invalid_argument", "message_id must be a canonical UUID") from exc
+            if str(parsed_message_id) != message_id:
+                raise ClientError("invalid_argument", "message_id must be a canonical UUID")
             payload["id"] = message_id
+        if reply_to is not None:
+            if not isinstance(reply_to, str) or not ID_RE.fullmatch(reply_to):
+                raise ClientError("invalid_argument", "reply_to must be a valid message ID")
+            payload["reply_to"] = reply_to
         return self._request(
             "POST",
             "/v1/messages",
@@ -196,12 +371,15 @@ class BrokerClient:
             },
         )
 
-    def poll(self, recipient: str) -> Any:
+    def poll(self, recipient: str, status: str | None = None) -> Any:
         self._require_id(recipient, "recipient")
+        if status not in (None, "queued"):
+            raise ClientError("invalid_argument", "status must be queued when specified")
         messages = []
         after = None
         while True:
-            query = urllib.parse.urlencode({"recipient": recipient, **({"after": after} if after is not None else {})})
+            query = urllib.parse.urlencode({"recipient": recipient, **({"after": after} if after is not None else {}),
+                                            **({"status": status} if status else {})})
             page = self._request("GET", f"/v1/messages?{query}")
             if not isinstance(page, dict) or not isinstance(page.get("messages"), list):
                 raise ClientError("invalid_response", "Broker returned an invalid inbox")
@@ -220,6 +398,94 @@ class BrokerClient:
             "POST",
             "/v1/ack",
             {"id": message_id, "recipient": recipient},
+        )
+
+    def message_status(self, recipient: str, message_id: str, actor: str | None = None) -> Any:
+        self._require_id(recipient, "recipient")
+        self._require_id(message_id, "message_id")
+        query = {"recipient": recipient, "id": message_id}
+        if actor is not None:
+            self._require_id(actor, "actor")
+            query["actor"] = actor
+        return self._request("GET", "/v1/messages/status?" + urllib.parse.urlencode(query))
+
+    def create_room(self, room_id: str, name: str, owner: str, members: list[str]) -> Any:
+        """Create an explicitly named room with an explicit member list."""
+        self._require_room_id(room_id, "room_id")
+        self._require_room_id(owner, "owner")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > MAX_ROOM_NAME:
+            raise ClientError(
+                "invalid_argument",
+                f"name must contain 1 to {MAX_ROOM_NAME} characters",
+            )
+        if not isinstance(members, list) or not 1 <= len(members) <= MAX_ROOM_MEMBERS:
+            raise ClientError(
+                "invalid_argument",
+                f"members must contain 1 to {MAX_ROOM_MEMBERS} session IDs",
+            )
+        for member in members:
+            self._require_room_id(member, "member")
+        if len(set(members)) != len(members):
+            raise ClientError("invalid_argument", "members must be unique")
+        if owner not in members:
+            raise ClientError("invalid_argument", "owner must be an explicit member")
+        return self._request(
+            "POST",
+            "/v1/rooms",
+            {"room_id": room_id, "name": name, "owner": owner, "members": members},
+        )
+
+    def room_info(self, room_id: str, member: str) -> Any:
+        """Read room details as an explicitly named member."""
+        self._require_room_id(room_id, "room_id")
+        self._require_room_id(member, "member")
+        query = urllib.parse.urlencode({"member": member})
+        return self._request("GET", f"/v1/rooms/{room_id}?{query}")
+
+    def update_room_member(self, room_id: str, actor: str, member: str, action: str) -> Any:
+        """Ask the broker to add or remove a member using explicit session IDs."""
+        self._require_room_id(room_id, "room_id")
+        self._require_room_id(actor, "actor")
+        self._require_room_id(member, "member")
+        if not isinstance(action, str) or action not in ("add", "remove"):
+            raise ClientError("invalid_argument", "action must be 'add' or 'remove'")
+        return self._request(
+            "POST",
+            f"/v1/rooms/{room_id}/members",
+            {"actor": actor, "member": member, "action": action},
+        )
+
+    def send_room_message(self, room_id: str, sender: str, text: str, batch_id: str) -> Any:
+        """Fan out one idempotent message to the room's current members."""
+        self._require_room_id(room_id, "room_id")
+        self._require_room_id(sender, "sender")
+        if not isinstance(text, str) or not text.strip() or len(text) > MAX_ROOM_MESSAGE_LENGTH:
+            raise ClientError(
+                "invalid_argument",
+                f"text must contain 1 to {MAX_ROOM_MESSAGE_LENGTH} characters",
+            )
+        self._require_batch_id(batch_id)
+        return self._request(
+            "POST",
+            f"/v1/rooms/{room_id}/messages",
+            {"sender": sender, "text": text, "batch_id": batch_id},
+        )
+
+    def reply_room(self, room_id: str, sender: str, text: str, batch_id: str, reply_to: str) -> Any:
+        """Reply to a message in a room, fanning out to its members."""
+        self._require_room_id(room_id, "room_id")
+        self._require_room_id(sender, "sender")
+        self._require_room_id(reply_to, "reply_to")
+        if not isinstance(text, str) or not text.strip() or len(text) > MAX_ROOM_MESSAGE_LENGTH:
+            raise ClientError(
+                "invalid_argument",
+                f"text must contain 1 to {MAX_ROOM_MESSAGE_LENGTH} characters",
+            )
+        self._require_batch_id(batch_id)
+        return self._request(
+            "POST",
+            f"/v1/rooms/{room_id}/reply-all",
+            {"sender": sender, "text": text, "batch_id": batch_id, "reply_to": reply_to},
         )
 
 
@@ -242,6 +508,11 @@ def _parser() -> argparse.ArgumentParser:
     send.add_argument("--sender", required=True)
     send.add_argument("--recipient", required=True)
     send.add_argument("--text", required=True)
+    send.add_argument(
+        "--message-id",
+        help="stable canonical UUID; reuse it with identical request fields when retrying (otherwise retries may duplicate)",
+    )
+    send.add_argument("--reply-to", help="message ID being replied to")
 
     send_group = commands.add_parser(
         "send-group", help="fan out one idempotent message to explicit session IDs"
@@ -273,7 +544,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "discover":
             result = client.discover()
         elif args.command == "send":
-            result = client.send(args.sender, args.recipient, args.text)
+            send_options = {"reply_to": args.reply_to}
+            if args.message_id is not None:
+                send_options["message_id"] = args.message_id
+            result = client.send(args.sender, args.recipient, args.text, **send_options)
         elif args.command == "send-group":
             result = client.send_group(args.sender, args.recipients, args.text, args.batch_id)
         elif args.command == "poll":

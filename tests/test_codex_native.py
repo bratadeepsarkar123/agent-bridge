@@ -1,8 +1,10 @@
 import json
+import queue
+import threading
 import unittest
 from unittest.mock import Mock
 
-from codex_native import deliver_message
+from codex_native import AppServerProxy, deliver_message
 
 
 THREAD = '123e4567-e89b-12d3-a456-426614174000'
@@ -10,6 +12,35 @@ MESSAGE = '987e6543-e21b-12d3-a456-426614174000'
 
 
 class NativeDeliveryTests(unittest.TestCase):
+    def test_persistent_reader_waits_without_an_idle_timeout(self):
+        proxy = object.__new__(AppServerProxy)
+        proxy.timeout = None
+        proxy.queue = queue.Queue(maxsize=2)
+        proxy.buffer = bytearray()
+        values = []
+        reader = threading.Thread(target=lambda: values.append(proxy.read_exact(3)))
+        reader.start()
+        proxy.queue.put(b'abc')
+        reader.join(1)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual([b'abc'], values)
+
+    def test_full_buffer_reader_can_stop(self):
+        proxy = object.__new__(AppServerProxy)
+        proxy.queue = queue.Queue(maxsize=2)
+        proxy._closed = threading.Event()
+        proxy.proc = Mock()
+        proxy.proc.stdout.read.return_value = b'event'
+        reader = threading.Thread(target=proxy._read, daemon=True)
+        reader.start()
+        try:
+            proxy.queue.put_nowait(b'fill')
+        except queue.Full:
+            pass
+        proxy._closed.set()
+        reader.join(1)
+        self.assertFalse(reader.is_alive())
+
     def test_sends_external_tool_output_without_user_input_or_resume(self):
         proxy = Mock()
         proxy.request.side_effect = [{'thread': {'id': THREAD, 'status': {'type': 'active', 'activeFlags': []}}}, {'turn': {'id': 'turn-1'}}]
@@ -39,6 +70,26 @@ class NativeDeliveryTests(unittest.TestCase):
                    'text': 'hello', 'status': 'queued'}
         deliver_message(proxy, THREAD, message)
         self.assertEqual(['thread/read', 'turn/start'], [c.args[0] for c in proxy.request.call_args_list])
+
+    def test_room_context_is_in_agent_event(self):
+        proxy = Mock()
+        proxy.request.side_effect = [{'thread': {'id': THREAD, 'status': {'type': 'idle'}}}, {'turn': {'id': 'turn'}}]
+        deliver_message(proxy, THREAD, {'id': MESSAGE, 'sender': 'claude-test', 'recipient': THREAD,
+                        'text': 'hello', 'status': 'queued', 'room_id': 'team', 'reply_to': 'parent'})
+        payload = json.loads(proxy.request.call_args_list[1].args[1]['toolOutput']['output'])
+        self.assertEqual(('team', 'parent'), (payload['room_id'], payload['reply_to']))
+
+    def test_direct_reply_link_is_in_agent_event(self):
+        proxy = Mock()
+        proxy.request.side_effect = [{'thread': {'id': THREAD, 'status': {'type': 'idle'}}},
+                                     {'turn': {'id': 'turn'}}]
+        deliver_message(proxy, THREAD, {
+            'id': MESSAGE, 'sender': 'claude-test', 'recipient': THREAD,
+            'text': 'answer', 'status': 'queued', 'reply_to': 'parent-message',
+        })
+        payload = json.loads(proxy.request.call_args_list[1].args[1]['toolOutput']['output'])
+        self.assertEqual('parent-message', payload['reply_to'])
+        self.assertNotIn('room_id', payload)
 
 
 if __name__ == '__main__':
