@@ -346,15 +346,18 @@ class ClaudeAdapter:
                     parsed_message_id = None
                 if parsed_message_id is None or str(parsed_message_id) != message_id:
                     return self.tool_result("message_id must be a canonical UUID.", True)
-            send_options = {}
+            else:
+                # One ID per logical send; a failed call reports it so a retry reuses it.
+                message_id = str(uuid.uuid4())
+            send_options = {"message_id": message_id}
             if reply_to is not None:
                 send_options["reply_to"] = reply_to
-            if message_id is not None:
-                send_options["message_id"] = message_id
             try:
                 result = self.broker.send(self.session_id, recipient, text, **send_options)
             except (BrokerError, OSError) as exc:
-                return self.tool_result("Could not queue message: {}".format(exc), True)
+                return self.tool_result(
+                    "Could not queue message {}: {} Retry with message_id {} to avoid a duplicate.".format(
+                        message_id, exc, message_id), True)
             message_id = result.get("id")
             status = result.get("status", "queued")
             return self.tool_result("Queued message {} ({}; delivery is unconfirmed).".format(
