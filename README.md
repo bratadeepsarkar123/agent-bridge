@@ -138,7 +138,7 @@ Claude status covers the original monitored PID only, not later resumptions.
 as follow-up input in an existing Codex thread. It requires an explicit thread
 UUID. Without `--deliver`, it only reports what it would forward. With
 `--deliver`, it runs `codex queue` using that UUID; the user-facing status
-is **“queued as follow-up input (not native agent message)”**. This is not a
+is **â€œqueued as follow-up input (not native agent message)â€**. This is not a
 native message to an already-running agent. The adapter never acknowledges the
 broker message. A local SQLite ledger records each message UUID before launch
 and prevents another attempt after accepted, uncertain, or interrupted output.
@@ -210,5 +210,8 @@ It starts no chats and uses no model inference.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+The code in this repository is released under the Creative Commons CC0 1.0 Universal dedication (see [LICENSE](LICENSE)). To the extent possible under law, the author has waived copyright and related rights.
 
+The code was written with AI tools. Under current US Copyright Office guidance, purely AI-generated material may not be copyrightable, so this dedication states that no copyright is claimed. CC0 gives no warranty and no express patent license.
+
+Releases before this change were published under Apache License 2.0; those tags keep the Apache terms.
