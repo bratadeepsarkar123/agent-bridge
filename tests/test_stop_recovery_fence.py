@@ -117,31 +117,78 @@ class StopRecoveryFenceTests(unittest.TestCase):
                 supervisor.run()
             launch.assert_not_called()
 
-    def test_publication_failure_refuses_drain(self):
-        failed = threading.Event()
+    @patch.object(broker, 'FENCE_RETRY_BASE', 0.0)
+    def test_failed_inhibit_write_keeps_serving_and_retries_before_drain(self):
+        real_publish = broker.publish_stop_inhibit
+        attempts = []
         server = Mock()
-        def fail_publish(*args):
-            failed.set()
-            raise OSError('synthetic disk failure')
-        def leave_loop():
-            if not failed.wait(2):
-                raise AssertionError('control thread did not attempt publication')
-            raise KeyboardInterrupt()
-        server.handle_request.side_effect = leave_loop
-        with patch.object(sys, 'argv', ['broker.py', '--control-stdin', '--state', str(self.state)]), \
-                patch.object(sys, 'stdin', io.StringIO('')), \
+        server.active_handlers = 0
+        server.wait_for_drain.return_value = True
+        serve_passes = []
+        def fail_twice_then_publish(*args):
+            attempts.append(1)
+            if len(attempts) <= 2:
+                raise OSError('synthetic disk failure')
+            return real_publish(*args)
+        def serve_then_interrupt():
+            serve_passes.append(len(attempts))
+            if not attempts:
+                raise KeyboardInterrupt()
+        server.handle_request.side_effect = serve_then_interrupt
+        with patch.object(sys, 'argv', ['broker.py', '--state', str(self.state)]), \
                 patch.object(broker, 'require_current_schema_or_empty'), \
                 patch.object(broker, '_prepare_server', return_value=(server, self.raw)), \
-                patch.object(broker, 'publish_stop_inhibit', side_effect=fail_publish), \
+                patch.object(broker, 'publish_stop_inhibit', side_effect=fail_twice_then_publish), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                broker.main()
+        # One serving pass in the main loop, then one pass after each of the two
+        # failed writes; the third write succeeded and drain began.
+        self.assertEqual(3, len(attempts))
+        self.assertEqual(3, server.handle_request.call_count)
+        server.begin_drain.assert_called_once()
+        self.assertFalse(self.state.exists())
+        self.assertFalse(broker.stop_marker_path(self.state).exists())
+
+    @patch.object(broker, 'FENCE_RETRY_BASE', 0.0)
+    def test_unpublishable_inhibit_never_drains_while_still_serving(self):
+        server = Mock()
+        serve_calls = []
+        class Stop(Exception):
+            pass
+        def serve_then_stop():
+            serve_calls.append(1)
+            if len(serve_calls) >= 3:
+                raise Stop()
+        server.handle_request.side_effect = serve_then_stop
+        with patch.object(sys, 'argv', ['broker.py', '--state', str(self.state)]), \
+                patch.object(broker, 'require_current_schema_or_empty'), \
+                patch.object(broker, '_prepare_server', return_value=(server, self.raw)), \
+                patch.object(broker, 'publish_stop_inhibit', side_effect=OSError('synthetic disk failure')), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaises(Stop):
+                broker.main()
+        # Still serving on every retry pass: no drain, no discovery removal.
+        # (Stop is raised on the third pass and again on the retry after it.)
+        self.assertGreaterEqual(len(serve_calls), 3)
+        server.begin_drain.assert_not_called()
+        self.assertEqual(self.raw, self.state.read_bytes())
+        self.assertFalse(broker.stop_marker_path(self.state).exists())
+
+    def test_refused_inhibit_still_exits_with_rollout_blocker(self):
+        server = Mock()
+        server.handle_request.side_effect = KeyboardInterrupt()
+        with patch.object(sys, 'argv', ['broker.py', '--state', str(self.state)]), \
+                patch.object(broker, 'require_current_schema_or_empty'), \
+                patch.object(broker, '_prepare_server', return_value=(server, self.raw)), \
+                patch.object(broker, 'publish_stop_inhibit', side_effect=RuntimeError('refused')), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as error:
                 broker.main()
         server.begin_drain.assert_not_called()
         self.assertIn('ROLLOUT BLOCKER', str(error.exception))
         self.assertEqual(self.raw, self.state.read_bytes())
-        self.assertFalse(broker.stop_marker_path(self.state).exists())
-        # Deliberately expose the unresolved rollout blocker: after process
-        # death, retained discovery without an inhibit permits auto-recovery.
+        # After process death with no inhibit, a supervisor may auto-recover.
         with patch.object(supervisor, 'STATE', self.state), \
                 patch.object(supervisor, '_process_is_alive', return_value=False):
             self.assertEqual('crashed', supervisor.inspect_broker())
@@ -228,6 +275,55 @@ class StopRecoveryFenceTests(unittest.TestCase):
 
     def test_startup_stdout_failure_with_eof_does_not_join_blocked_control(self):
         self.exercise_main(print_failure=True)
+
+    @patch.object(broker, 'FENCE_RETRY_BASE', 0.0)
+    def test_control_stop_retries_failed_inhibit_instead_of_dropping_stop(self):
+        real_publish = broker.publish_stop_inhibit
+        attempts = []
+        def fail_once_then_publish(*args):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError('synthetic disk failure')
+            return real_publish(*args)
+        server = Mock()
+        server.active_handlers = 0
+        server.wait_for_drain.return_value = True
+        server.handle_request.side_effect = lambda: threading.Event().wait(.01)
+        argv = ['broker.py', '--control-stdin', '--state', str(self.state), '--drain-timeout', '1']
+        with patch.object(sys, 'argv', argv), patch.object(sys, 'stdin', io.StringIO('stop\n')), \
+                patch.object(broker, 'require_current_schema_or_empty'), \
+                patch.object(broker, '_prepare_server', return_value=(server, self.raw)), \
+                patch.object(broker, 'publish_stop_inhibit', side_effect=fail_once_then_publish), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            broker.main()
+        # The first write failed, the control thread retried, and only then drained.
+        self.assertEqual(2, len(attempts))
+        server.begin_drain.assert_called()
+        self.assertFalse(self.state.exists())
+        self.assertFalse(broker.stop_marker_path(self.state).exists())
+
+    def test_retry_delay_doubles_from_base_and_is_capped(self):
+        self.assertEqual(1.0, broker.fence_retry_delay(1))
+        self.assertEqual(2.0, broker.fence_retry_delay(2))
+        self.assertEqual(16.0, broker.fence_retry_delay(5))
+        self.assertEqual(30.0, broker.fence_retry_delay(6))
+        self.assertEqual(30.0, broker.fence_retry_delay(10_000))
+
+    def test_fence_retry_log_limits_messages_and_alerts_once(self):
+        log = broker.FenceRetryLog('shutdown')
+        err = io.StringIO()
+        with redirect_stderr(err):
+            delays = [log.failed(OSError('synthetic')) for _ in range(60)]
+        lines = err.getvalue().splitlines()
+        # Three burst messages within the same minute, then exactly one alert at the threshold.
+        self.assertEqual(broker.FENCE_LOG_BURST + 1, len(lines))
+        self.assertEqual(1, sum(line.startswith('ALERT') for line in lines))
+        self.assertEqual(30.0, delays[-1])
+        # A later failure, once the interval has passed, is logged again.
+        log.last_logged -= broker.FENCE_LOG_INTERVAL + 1
+        with redirect_stderr(err):
+            log.failed(OSError('synthetic'))
+        self.assertEqual(broker.FENCE_LOG_BURST + 2, len(err.getvalue().splitlines()))
 
 
 if __name__ == '__main__':
