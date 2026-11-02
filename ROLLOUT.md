@@ -86,6 +86,16 @@ Resolve these before a production-like cutover:
    helper must stop the guard first, stop the supervisor, request the broker
    drain, stop remaining children in order, and confirm cleanup. Until then, a
    controlled live restart is blocked.
+
+   **Status (branch `feature/service-stop-helper`, not merged):** `service_stop.py`
+   implements this order with `stop` and `restart` subcommands, `--dry-run` and
+   `--root`. `tests/test_service_stop.py` covers it with injected fakes only; it
+   has not been run against real processes. Open: `service_guard.py` and
+   `supervisor.py` still have no graceful stop channel. On Windows the helper's
+   exit request is a non-forced `taskkill`, which may not stop a windowless
+   process; a live stop would then fail at step 1 and nothing is force-killed.
+   Live use stays blocked until a real stop channel is verified on a process.
+
 2. **The staged starter is path-bound.** `start-broker.ps1` recognizes a running
    broker only when its command line contains `agent-bridge-experiment`. It is
    wrong for a staged checkout and must be made path-independent and tested.
