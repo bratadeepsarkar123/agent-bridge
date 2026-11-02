@@ -144,6 +144,8 @@ class WindowsCredentialStoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        # Provisioning refuses any directory whose ACL is not private.
+        store.apply_private_acl(self.temp.name, directory=True)
         self.path = Path(self.temp.name) / 'generation.dpapi'
         self.secret = token()
 
@@ -169,7 +171,8 @@ class WindowsCredentialStoreTests(unittest.TestCase):
             store.provision_initial_profile(broker, 'configured-profile', self.temp.name)
         self.assertEqual(previous, path.read_bytes())
         self.assertTrue(broker.credential_is_valid(self.secret.decode()))
-        self.assertEqual(2, len(list(Path(self.temp.name).glob('*.dpapi'))))
+        # A duplicate profile is refused before any new file is written.
+        self.assertEqual(1, len(list(Path(self.temp.name).glob('*.dpapi'))))
 
     def test_initial_profile_verification_failure_never_binds(self):
         broker = Broker(Path(self.temp.name) / 'isolated.sqlite3')

@@ -334,6 +334,26 @@ class ClaudeAdapterProtocolTests(unittest.TestCase):
         self.assertEqual(self.broker.sent, [("claude-session", "codex", "hello")])
         self.assertIn("delivery is unconfirmed", self.output_messages()[0]["result"]["content"][0]["text"])
 
+    def test_send_without_id_generates_one_and_failure_reports_it_for_retry(self):
+        failing = Mock(side_effect=BrokerError("broker not reachable"))
+        self.broker.send = failing
+
+        result = self.adapter.call_tool({"name": "bridge_send", "arguments": {
+            "recipient": "codex", "text": "hello"}})
+
+        self.assertTrue(result["isError"])
+        sent_id = failing.call_args.kwargs["message_id"]
+        self.assertRegex(sent_id, r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+        self.assertIn(sent_id, result["content"][0]["text"])
+        self.assertIn("Retry with message_id", result["content"][0]["text"])
+
+        # A retry that reuses the reported ID is forwarded unchanged.
+        self.broker.send = Mock(return_value={"id": sent_id, "status": "queued"})
+        retry = self.adapter.call_tool({"name": "bridge_send", "arguments": {
+            "recipient": "codex", "text": "hello", "message_id": sent_id}})
+        self.assertNotIn("isError", retry)
+        self.broker.send.assert_called_once_with("claude-session", "codex", "hello", message_id=sent_id)
+
     def test_send_requires_explicit_recipient(self):
         result = self.adapter.call_tool({"name": "bridge_send", "arguments": {"text": "hello"}})
         self.assertTrue(result["isError"])

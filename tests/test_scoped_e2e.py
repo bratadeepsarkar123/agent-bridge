@@ -17,6 +17,7 @@ from codex_client import BrokerClient as CodexClient, ClientError
 from message_status import message_status
 from multi_dispatcher import MultiRecipientDispatcher, validate_holder_participants
 from codex_queue import DeliveryLedger
+import credential_store
 from credential_store import provision_initial_profile
 
 A = '123e4567-e89b-12d3-a456-426614174000'
@@ -28,6 +29,8 @@ class ScopedClientIntegrationTests(unittest.TestCase):
     def test_user_protected_credentials_work_across_both_clients(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
+            # Provisioning refuses any directory whose ACL is not private.
+            credential_store.apply_private_acl(root, directory=True)
             broker = Broker(root / 'db.sqlite3')
             a = provision_initial_profile(broker, A, root)
             b = provision_initial_profile(broker, B, root)

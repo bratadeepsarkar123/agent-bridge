@@ -13,6 +13,7 @@ import time
 import uuid
 from pathlib import Path
 
+import child_stop
 from codex_client import BrokerClient, ClientError
 from monitor import process_status
 
@@ -94,11 +95,17 @@ def main():
     args = parser.parse_args()
     if args.pid <= 0 or args.interval < 5:
         parser.error('PID must be positive and interval at least 5 seconds')
+    stop_request = child_stop.request_path(__file__)
     while True:
+        # Checked before every pass, so a stopped watcher starts no new work.
+        if stop_request.exists():
+            print(json.dumps({'status': 'stop_requested'}), flush=True)
+            child_stop.consume(stop_request)
+            return
         result = watch_once(args.pid, args.recipient, args.state)
         if result.get('change'):
             print(json.dumps(result), flush=True)
-        time.sleep(args.interval)
+        child_stop.pause(args.interval, stop_request)
 
 
 if __name__ == '__main__':

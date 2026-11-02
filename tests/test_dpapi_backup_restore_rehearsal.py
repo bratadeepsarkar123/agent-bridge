@@ -38,6 +38,8 @@ class DpapiBackupRestoreRehearsalTests(unittest.TestCase):
             restored_credentials = root / "restored-credentials"
             source_credentials.mkdir()
             restored_credentials.mkdir()
+            # Provisioning refuses any directory whose ACL is not private.
+            credential_store.apply_private_acl(source_credentials, directory=True)
 
             profile_id = "synthetic-dpapi-profile"
             source_broker = Broker(source_db)

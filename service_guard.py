@@ -13,6 +13,9 @@ from lockfile import acquire, release
 
 ROOT = Path(__file__).resolve().parent
 LOCK = ROOT / 'service-guard.json'
+# Graceful stop channel: service_stop.py creates this file; the guard consumes it
+# and exits its loop. The guard never signals or kills its children.
+STOP_REQUEST = ROOT / 'service-guard.stop-request'
 ALLOWED = {
     'native_worker.py',
     'watch_session.py',
@@ -96,6 +99,42 @@ def save_config(path, services):
             pass
 
 
+def _pause(seconds, stop_request, pause):
+    """Sleep in slices of at most one second, returning early when a stop request appears."""
+    remaining = seconds
+    while remaining > 0 and not stop_request.exists():
+        step = min(1.0, remaining)
+        pause(step)
+        remaining -= step
+
+
+def run_loop(services, config_path, interval, stop_request, *, check=check_once,
+             save=save_config, say=print, pause=time.sleep):
+    """Check services each pass until a stop request is seen.
+
+    The request is checked before every pass, so a stopped guard spawns nothing.
+    On a stop, the request file is consumed and the loop returns. Children are
+    neither signalled nor killed here; they keep running.
+    """
+    while True:
+        if stop_request.exists():
+            say(json.dumps({'status': 'stop_requested'}))
+            try:
+                stop_request.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        try:
+            events = check(services)
+            if any(event.get('status') == 'start_requested' for event in events):
+                save(config_path, services)
+            for event in events:
+                say(json.dumps(event))
+        except (OSError, ValueError) as exc:
+            say(json.dumps({'status': 'guard_error', 'error_type': type(exc).__name__}))
+        _pause(interval, stop_request, pause)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
@@ -111,16 +150,7 @@ def main():
         validate_service(service)
     acquire(LOCK, {})
     try:
-        while True:
-            try:
-                events = check_once(services)
-                if any(event.get('status') == 'start_requested' for event in events):
-                    save_config(args.config, services)
-                for event in events:
-                    print(json.dumps(event), flush=True)
-            except (OSError, ValueError) as exc:
-                print(json.dumps({'status': 'guard_error', 'error_type': type(exc).__name__}), flush=True)
-            time.sleep(args.interval)
+        run_loop(services, args.config, args.interval, STOP_REQUEST, say=lambda line: print(line, flush=True))
     finally:
         release(LOCK)
 
