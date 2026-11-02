@@ -130,6 +130,11 @@ Resolve these before a production-like cutover:
    replace a hash, but there is no coordinated generation/file/client cutover or
    recovery path. Do not rotate in place. Existing profiles need an explicit,
    reviewed rotation design.
+
+   **Status (branch `feature/credential-rotation-design`, not merged):** the design
+   is written in `docs/CREDENTIAL_ROTATION_DESIGN.md`. Rotation is still NOT
+   implemented; the owner decisions listed there are open.
+
 6. **The launcher cannot provision a fresh Claude identity cleanly.**
    `launch-claude.ps1` generates an ID internally for a new session; if an ID is
    supplied, it treats it as a resume. It does not create a fresh supplied ID or
@@ -149,6 +154,7 @@ Resolve these before a production-like cutover:
    no-argument path are unchanged. Tests run `-PrepareOnly` against a temp copy
    only. Still open: the launch branch (credential variables set around the real
    `claude.exe` call) has not been run in a real process on a disposable copy.
+
 7. **Some clients only support one credential per process.** `native_worker.py`
    has no credential argument and reads the process environment; the MCP client
    also uses one environment credential. `multi_dispatcher.py` supports
@@ -171,6 +177,7 @@ Resolve these before a production-like cutover:
    copy, so this branch does not change it; the same guard must be added when
    that work is committed. The broker protocol is unchanged. Tests use fake
    environments only.
+
 8. **This authenticates a configured profile, not a real chat/thread.** A local
    process running as the same Windows user can decrypt DPAPI credentials, and
    the broker does not independently prove that a request came from the thread
