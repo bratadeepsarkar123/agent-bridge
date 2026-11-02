@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,36 @@ class _UseEnvironmentCredentialFile:
 
 
 _USE_ENVIRONMENT_CREDENTIAL_FILE = _UseEnvironmentCredentialFile()
+
+
+def require_single_environment_profile(profile_ids: Iterable[str], environ: Mapping[str, str] | None = None) -> None:
+    """Refuse a one-credential-per-process client that would serve several profiles.
+
+    The environment credential (BRIDGE_SESSION_CREDENTIAL_FILE) is one file for the
+    whole process, so it can authenticate only one profile. When it is set and the
+    process would act for more than one distinct profile, refuse before any
+    connection is made. Without an environment credential nothing is shared, so
+    only the caller's own one-profile rule applies. For several profiles use
+    multi_dispatcher.py with one --credential SESSION_UUID=PATH per profile.
+    """
+    env = os.environ if environ is None else environ
+    distinct = sorted(set(profile_ids))
+    if len(distinct) <= 1:
+        return
+    if env.get(SESSION_CREDENTIAL_FILE_ENV):
+        raise ClientError(
+            "environment_credential_shared",
+            f"Refused: {len(distinct)} profiles would share one environment credential "
+            f"({SESSION_CREDENTIAL_FILE_ENV}), which can authenticate only one profile. "
+            "Use multi_dispatcher.py with --recipient and --credential SESSION_UUID=PATH "
+            "for each profile.",
+        )
+    raise ClientError(
+        "multiple_profiles_unsupported",
+        f"Refused: this client serves one profile per process, not {len(distinct)}. "
+        "Use multi_dispatcher.py with --recipient and --credential SESSION_UUID=PATH "
+        "for each profile.",
+    )
 
 
 class ClientError(Exception):

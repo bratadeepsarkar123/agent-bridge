@@ -205,9 +205,13 @@ class ProvisionProfileTests(unittest.TestCase):
         self.assertEqual(0, self.cli(*self.provision_args('alpha'))[0])
         code, out, err = self.cli('check', 'alpha', '--database', str(self.database))
         self.assertEqual(0, code, err)
-        self.assertEqual({'bound': True, 'id': 'alpha', 'opted_in': False}, json.loads(out))
+        result = json.loads(out)
+        self.assertEqual({'bound': True, 'id': 'alpha', 'opted_in': False}, {k: result[k] for k in ('bound', 'id', 'opted_in')})
+        self.assertIn('NOT proof', result['note'])
+        self.assertIn('thread-identity', result['note'])
         code, out, err = self.cli('check', 'nobody', '--database', str(self.database))
-        self.assertEqual({'bound': False, 'id': 'nobody', 'opted_in': False}, json.loads(out))
+        result = json.loads(out)
+        self.assertEqual({'bound': False, 'id': 'nobody', 'opted_in': False}, {k: result[k] for k in ('bound', 'id', 'opted_in')})
 
     def test_missing_database_is_refused_and_not_created(self):
         missing = self.root / 'absent.sqlite3'

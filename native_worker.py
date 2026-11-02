@@ -2,13 +2,18 @@
 
 Runs until stopped. Does not create/resume threads, impersonate the user, or
 automatically approve anything. Uncertain deliveries are never blindly retried.
+
+One process serves one recipient and reads its credential from the environment
+(BRIDGE_SESSION_CREDENTIAL_FILE). Several protected profiles must not share that
+one environment credential: this worker refuses more than one --recipient. Use
+multi_dispatcher.py with --credential SESSION_UUID=PATH for each profile.
 """
 import argparse
 import json
 import time
 from pathlib import Path
 
-from codex_client import BrokerClient, ClientError
+from codex_client import BrokerClient, ClientError, require_single_environment_profile
 from codex_native import AppServerProxy, ProxyError, RPCRejected, TargetUnavailable, deliver_message
 from codex_queue import DeliveryLedger, QueueError, canonical_uuid
 from lockfile import acquire, release
@@ -76,15 +81,21 @@ def drain_once(recipient, broker, ledger, proxy_factory=AppServerProxy, idle_onl
     return results
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--recipient', required=True)
+    parser.add_argument('--recipient', action='append', required=True,
+                        help='one Codex thread ID; repeating it is refused (use multi_dispatcher.py)')
     parser.add_argument('--interval', type=int, default=10)
     parser.add_argument('--idle-only', action='store_true', help='hold messages while the target is active')
     parser.add_argument('--keep-loaded', action='store_true',
                         help='explicitly permit resuming this thread and keeping a subscription open')
-    args = parser.parse_args()
-    recipient = canonical_uuid(args.recipient, 'recipient')
+    args = parser.parse_args(argv)
+    try:
+        recipients = [canonical_uuid(value, 'recipient') for value in args.recipient]
+        require_single_environment_profile(recipients)
+    except (ClientError, ValueError) as exc:
+        parser.error(getattr(exc, 'message', str(exc)))
+    recipient = recipients[0]
     if args.interval < 5:
         parser.error('interval must be at least 5 seconds')
     lock = ROOT / ('native-worker-' + recipient + '.json')

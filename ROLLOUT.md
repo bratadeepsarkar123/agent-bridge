@@ -135,17 +135,56 @@ Resolve these before a production-like cutover:
    supplied, it treats it as a resume. It does not create a fresh supplied ID or
    set session-specific credential environment variables. Add a prepare-then-
    provision-then-launch flow before protecting newly created Claude sessions.
+
+   **Status (branch `feature/launcher-and-client-credentials`, not merged):**
+   `launch-claude.ps1 -FreshSessionId <UUID> -CredentialsDir <DIR>` starts a new
+   session with a supplied UUID. It refuses a non-UUID, a missing folder, or a
+   combination with `-ClaudeSessionId`. It calls `provision_profile.py provision`
+   (broker running: the active token is read from the state file; exit 3 means
+   "unsure, do not retry this ID"). The credential value and file path are never
+   printed. The Claude process gets `BRIDGE_SESSION_CREDENTIAL_FILE` and
+   `BRIDGE_SESSION_CREDENTIAL_FORMAT=dpapi` for that launch only, then the caller's
+   values are restored. `-PrepareOnly` provisions and writes the MCP config but
+   does not launch; it reports variable names only. The resume path and the
+   no-argument path are unchanged. Tests run `-PrepareOnly` against a temp copy
+   only. Still open: the launch branch (credential variables set around the real
+   `claude.exe` call) has not been run in a real process on a disposable copy.
 7. **Some clients only support one credential per process.** `native_worker.py`
    has no credential argument and reads the process environment; the MCP client
    also uses one environment credential. `multi_dispatcher.py` supports
    per-recipient files with `--credential SESSION_UUID=PATH`. Do not put several
    protected profiles behind one environment credential; add per-recipient
    support or use the explicitly configured dispatcher.
+
+   **Status (branch `feature/launcher-and-client-credentials`, not merged):**
+   `codex_client.require_single_environment_profile` refuses a one-credential
+   client that would act for more than one distinct profile. When
+   `BRIDGE_SESSION_CREDENTIAL_FILE` is set, that is refused with a message that
+   names `multi_dispatcher.py`; without it, the message says the client serves one
+   profile per process. `native_worker.py` now takes `--recipient` repeatedly only
+   so that a second recipient is refused before any lock, connection, or read.
+   **`multi_dispatcher.py` with `--recipient` and `--credential SESSION_UUID=PATH`
+   for each profile is the supported path for several profiles.** The Codex MCP
+   server (`codex_mcp.py`) has no profile argument, so it serves the single
+   identity of its environment credential and is not changed. The Claude MCP
+   client (`claude_adapter.py`) has uncommitted credential work in the working
+   copy, so this branch does not change it; the same guard must be added when
+   that work is committed. The broker protocol is unchanged. Tests use fake
+   environments only.
 8. **This authenticates a configured profile, not a real chat/thread.** A local
    process running as the same Windows user can decrypt DPAPI credentials, and
    the broker does not independently prove that a request came from the thread
    named by its profile ID. A profile ID must come from an operator-controlled
    mapping; this feature is not a same-user malware or thread-identity boundary.
+
+   **Stated limit (kept; no behaviour change, branch `feature/launcher-and-client-credentials`):**
+   A bound profile authenticates a configured identity only. It is not proof that
+   a real chat or thread sent a request. A process running as the same Windows user
+   can decrypt the DPAPI credential, and the broker does not prove which thread a
+   request came from. Operators must not read a profile ID, `bound`, or `opted_in` as
+   a thread-identity guarantee. `provision_profile.py check` now prints this limit in
+   its JSON output (`note` field), and the launcher's fresh-session flow (item 6)
+   inherits it.
 
 The staged broker keeps the shared bearer for unprotected profiles. Protection
 starts only after a profile is bound and its client presents that credential.

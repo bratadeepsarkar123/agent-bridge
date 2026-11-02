@@ -10,6 +10,8 @@ Subcommands (all output is JSON on stdout; errors are short sentences on stderr)
       shared-token check was not loaded.
   check PROFILE_ID [--database PATH]
       Read-only: report whether the profile is bound and opted in. No secret.
+      The output also states the limit: a profile is not a thread-identity
+      guarantee (same-user software can decrypt the credential).
   recover --credentials-dir DIR [--database PATH]
       Read-only: report each credential-*.dpapi file as bound, orphan, or
       unreadable. Nothing is bound, overwritten, renamed, or deleted.
@@ -103,12 +105,21 @@ def cmd_provision(args):
     return EXIT_OK
 
 
+PROFILE_LIMIT_NOTE = (
+    'A bound profile authenticates a configured identity only. It is NOT proof that a real '
+    'chat or thread sent a request: a process running as the same Windows user can decrypt '
+    'the DPAPI credential, and the broker does not prove which thread a request came from. '
+    'Do not treat a profile ID as a thread-identity guarantee.'
+)
+
+
 def cmd_check(args):
     broker = _open_broker(args.database)
     try:
         status = broker.profile_status(args.profile_id)
     except ValueError:
         raise CliRefusal('invalid profile id') from None
+    status['note'] = PROFILE_LIMIT_NOTE
     _emit(status)
     return EXIT_OK
 
