@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -188,18 +189,45 @@ class BrokerClient:
 
 class ClaudeAdapter:
     def __init__(self, session_id, codex_id, broker, stdout=None, stderr=None,
-                 poll_interval=POLL_INTERVAL_SECONDS):
+                 poll_interval=POLL_INTERVAL_SECONDS, parent_pid=None, sessions_dir=None):
         self.session_id = session_id
         self.codex_id = codex_id
         self.broker = broker
         self.stdout = stdout if stdout is not None else sys.stdout
         self.stderr = stderr if stderr is not None else sys.stderr
         self.poll_interval = poll_interval
+        # The Claude window that started this adapter. Its live record says which
+        # chat the window is really in right now, even after a /resume.
+        self.parent_pid = os.getppid() if parent_pid is None else parent_pid
+        self.sessions_dir = sessions_dir
+        self.identity_lock = threading.Lock()
         self.output_lock = threading.Lock()
         self.notified_lock = threading.Lock()
         self.notified_ids = set()
         self.initialized = threading.Event()
         self.stopping = threading.Event()
+
+    def current_id(self):
+        """Return the chat ID this window is in right now, switching registration if it changed.
+
+        If the window's live record shows a different ID (for example after /resume),
+        register that ID and use it for sends, replies and inbox delivery. If the
+        record is missing or the broker refuses, keep the current ID and try again later.
+        """
+        live = live_session_id(self.parent_pid, self.sessions_dir) if self.parent_pid else ""
+        if not live or live == self.session_id:
+            return self.session_id
+        with self.identity_lock:
+            if live == self.session_id:
+                return self.session_id
+            try:
+                self.broker.register(live)
+            except (BrokerError, OSError) as exc:
+                self.stderr.write("agent-bridge: could not switch to {}: {}\n".format(live, exc))
+                return self.session_id
+            self.stderr.write("agent-bridge: window is now session {} (was {})\n".format(live, self.session_id))
+            self.session_id = live
+            return self.session_id
 
     def write(self, message):
         with self.output_lock:
@@ -258,6 +286,12 @@ class ClaudeAdapter:
                 continue
             if self.stopping.is_set():
                 break
+            before = self.session_id
+            self.current_id()
+            if self.session_id != before:
+                # Switched chat: re-read the inbox for the new ID right away.
+                cursor = 0
+                last_heartbeat = -30.0
             try:
                 now = time.monotonic()
                 if now - last_heartbeat >= 30:
@@ -307,6 +341,8 @@ class ClaudeAdapter:
         args = params.get("arguments", {})
         if not isinstance(args, dict):
             return self.tool_result("Tool arguments must be an object.", True)
+        # Every send and ack uses the chat the window is in right now.
+        self.current_id()
 
         if name in ("bridge_room_send", "bridge_room_reply"):
             room_id, text, batch_id = args.get("room_id"), args.get("text"), args.get("batch_id")
@@ -542,6 +578,50 @@ class ClaudeAdapter:
             poll_thread.join(timeout=HTTP_TIMEOUT_SECONDS + 1)
 
 
+def claude_session_matches(parent_command_line, session_id):
+    """True only when the parent Claude process was started with this exact session ID.
+
+    A forked or resumed chat keeps its old transcript, so it can inherit another
+    chat's bridge config. The adapter must refuse to register under an ID that
+    its own Claude process does not carry in --session-id or --resume.
+    """
+    tokens = (parent_command_line or "").split()
+    for flag in ("--session-id", "--resume"):
+        for index, token in enumerate(tokens[:-1]):
+            if token == flag and tokens[index + 1].strip('"') == session_id:
+                return True
+    return False
+
+
+def live_session_id(pid, sessions_dir=None):
+    """Return the session ID Claude Code currently records for process `pid`, or ''.
+
+    Claude Code keeps a small record per running window in ~/.claude/sessions/<pid>.json.
+    Unlike the launch command line, this record follows the window through /resume,
+    so it is the real identity of the chat the adapter is serving.
+    """
+    base = Path(sessions_dir) if sessions_dir else Path.home() / ".claude" / "sessions"
+    try:
+        record = json.loads((base / "{}.json".format(int(pid))).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ""
+    session_id = record.get("sessionId") if isinstance(record, dict) else None
+    return session_id if isinstance(session_id, str) and ID_RE.fullmatch(session_id) else ""
+
+
+def parent_command_line(pid):
+    """Return the parent process command line on Windows, or '' if it cannot be read."""
+    if os.name != "nt":
+        return ""
+    script = ("(Get-CimInstance Win32_Process -Filter \"ProcessId={}\").CommandLine".format(int(pid)))
+    try:
+        completed = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                                   capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Claude MCP channel adapter for the local broker")
     parser.add_argument("--session-id", required=True, help="actual Claude session ID registered with the broker")
@@ -549,6 +629,20 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not ID_RE.fullmatch(args.session_id) or not ID_RE.fullmatch(args.codex_id):
         parser.error("session IDs must match the broker's allowed ID format")
+    if os.name == "nt":
+        live = live_session_id(os.getppid())
+        # The live record is authoritative. The command line is only a fallback
+        # when Claude Code has no record for this window.
+        if live:
+            allowed = live == args.session_id
+        else:
+            allowed = claude_session_matches(parent_command_line(os.getppid()), args.session_id)
+        if not allowed:
+            print("claude adapter refused: the Claude window that started this adapter is recorded as "
+                  "session {}, not {}. Restart the chat through the bridge launch script so it gets "
+                  "its own bridge ID.".format(live or "(none)", args.session_id),
+                  file=sys.stderr, flush=True)
+            return 3
 
     try:
         broker = BrokerClient(Path(__file__).with_name("broker-session.json"))
