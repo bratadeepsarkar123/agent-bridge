@@ -6,6 +6,7 @@ No live broker database, broker state, or credential file is read or written.
 from contextlib import closing, redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import secrets
 import sqlite3
@@ -102,7 +103,9 @@ class ProvisionProfileTests(unittest.TestCase):
 
     def test_collision_with_active_token_in_state_file_refused_by_cli(self):
         shared = secrets.token_urlsafe(32)
-        self.state.write_text(json.dumps({'port': 1, 'token': shared, 'pid': 1}), encoding='utf-8')
+        # The recorded PID must be alive for the token to be checked (this process is).
+        self.state.write_text(json.dumps({'port': 1, 'token': shared, 'pid': os.getpid()}),
+                              encoding='utf-8')
         with patch('credential_store.secrets.token_urlsafe', return_value=shared):
             code, out, err = self.cli(*self.provision_args('gamma'))
         self.assertEqual(1, code)

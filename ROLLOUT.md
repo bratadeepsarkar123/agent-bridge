@@ -112,14 +112,21 @@ Resolve these before a production-like cutover:
    broker only when its command line contains `agent-bridge-experiment`. It is
    wrong for a staged checkout and must be made path-independent and tested.
 3. **Provisioning CLI added (closed in code on this branch, pending review and a
-   real-process check).** `provision_profile.py` offers `provision`, `check`, and
-   `recover`. `recover` is report-only and never deletes or overwrites a file.
+   real-process check; both gaps found by the real-process check are fixed in
+   code, and the real-process re-check is still needed).** `provision_profile.py`
+   offers `provision`, `check`, and `recover`. Gap A: a state-file token that
+   already belongs to a bound profile is now a clean refusal (exit 1, "Refused:"
+   message, no traceback, no file or directory created). Gap B: `provision` checks
+   that the recorded broker PID is alive before it trusts the state-file token; a
+   dead PID reports `shared_token_checked: false` with a `reason` field and the
+   stored token is not used. The PID is only checked, never signalled. `recover` is report-only and never deletes or overwrites a file.
    A failure after a possible database commit exits 3 and says "unsure, do not
    retry blindly"; the outcome is confirmed by reading back the token hash. The
    credentials directory is created private through `credential_store`'s ACL
    helper and refused if an existing directory is not private.
 4. **Shared-token collision check is loaded on the provisioning path (closed in
-   code on this branch).** `Broker.provision_profile(...)` loads the active shared
+   code on this branch; both gaps above are fixed in code, real-process re-check
+   still needed).** `Broker.provision_profile(...)` loads the active shared
    token into the collision check before it provisions, and the CLI calls only
    that operation. `handler_for` uses the same `Broker.load_shared_token` method.
    A standalone `Broker(database)` therefore enforces the invariant on this path.
