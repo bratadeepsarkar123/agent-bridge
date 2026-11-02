@@ -13,6 +13,7 @@ import json
 import time
 from pathlib import Path
 
+import child_stop
 from codex_client import BrokerClient, ClientError, require_single_environment_profile
 from codex_native import AppServerProxy, ProxyError, RPCRejected, TargetUnavailable, deliver_message
 from codex_queue import DeliveryLedger, QueueError, canonical_uuid
@@ -110,7 +111,14 @@ def main(argv=None):
         previous = None
         holder_previous = None
         cursor = 0
+        stop_request = child_stop.request_path(__file__)
         while True:
+            # Checked before every pass: a stopped worker starts no new delivery.
+            # Returning runs the finally block, which closes the holder and releases the lock.
+            if stop_request.exists():
+                print(json.dumps({'status': 'stop_requested'}), flush=True)
+                child_stop.consume(stop_request)
+                return
             results = []
             if holder is not None and holder.status != holder_previous:
                 holder_previous = holder.status
@@ -138,7 +146,7 @@ def main(argv=None):
                 cursor = new_cursor
             except (ClientError, OSError, ValueError):
                 # Older brokers do not expose the wait endpoint yet.
-                time.sleep(args.interval)
+                child_stop.pause(args.interval, stop_request)
     finally:
         if 'holder' in locals() and holder is not None:
             holder.close()

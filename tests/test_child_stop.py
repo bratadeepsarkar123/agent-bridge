@@ -55,5 +55,25 @@ class WatchErrorsStopTests(unittest.TestCase):
                 child_stop.consume(request)
 
 
+class ChildContractTests(unittest.TestCase):
+    """Every child that service_stop can stop must poll its own request file."""
+
+    CHILDREN = ['native_worker.py', 'watch_session.py', 'watch_errors.py', 'multi_dispatcher.py']
+
+    def test_each_child_checks_and_consumes_its_request(self):
+        root = Path(__file__).resolve().parents[1]
+        for script in self.CHILDREN:
+            source = (root / script).read_text(encoding='utf-8')
+            self.assertIn('child_stop.request_path(__file__)', source, script)
+            self.assertIn('child_stop.consume(', source, script)
+
+    def test_children_never_use_taskkill_or_force(self):
+        root = Path(__file__).resolve().parents[1]
+        for script in self.CHILDREN:
+            source = (root / script).read_text(encoding='utf-8')
+            self.assertNotIn('taskkill', source, script)
+            self.assertNotIn('TerminateProcess', source, script)
+
+
 if __name__ == '__main__':
     unittest.main()
