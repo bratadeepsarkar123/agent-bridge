@@ -23,6 +23,7 @@ class PairedBackupSetTests(unittest.TestCase):
         self.state = self.root / 'broker-session.json'
         self.creds = self.root / 'creds'
         self.creds.mkdir()
+        credential_store.apply_private_acl(self.creds, directory=True)
         self.broker = Broker(self.database)
         credential_store.provision_initial_profile(self.broker, 'alpha', self.creds)
 

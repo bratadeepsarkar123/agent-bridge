@@ -144,6 +144,8 @@ class WindowsCredentialStoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        # Provisioning refuses any directory whose ACL is not private.
+        store.apply_private_acl(self.temp.name, directory=True)
         self.path = Path(self.temp.name) / 'generation.dpapi'
         self.secret = token()
 

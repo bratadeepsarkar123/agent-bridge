@@ -38,6 +38,14 @@ class BundleError(RuntimeError):
     """Sanitized failure: the set was not made or restored."""
 
 
+def _private_dir(path):
+    """Give a directory this process created a private ACL, verified before use."""
+    try:
+        credential_store.apply_private_acl(path, directory=True)
+    except credential_store.CredentialStoreError:
+        raise BundleError('could not make a private ACL on ' + Path(path).name) from None
+
+
 def _sha256_file(path):
     digest = hashlib.sha256()
     with open(path, 'rb') as stream:
@@ -97,6 +105,8 @@ def make_set(database, state, credentials_dir, set_dir):
     credentials_out = set_dir / CREDENTIALS
     credentials_out.mkdir()
     try:
+        _private_dir(set_dir)
+        _private_dir(credentials_out)
         db_out = set_dir / DATABASE
         try:
             db_digest = backup_tool.checked_backup(database, state, db_out)
@@ -160,7 +170,10 @@ def restore_set(set_dir, database_target, credentials_target, *, expected_databa
     credentials_target = Path(credentials_target)
     if database_target.exists():
         raise BundleError('restore target database already exists; choose a new path')
-    credentials_target.mkdir(parents=True, exist_ok=True)
+    if credentials_target.exists():
+        raise BundleError('restore target credentials directory already exists; choose a new path')
+    credentials_target.mkdir(parents=True)
+    _private_dir(credentials_target)
     for name in manifest['credential_files']:
         if (credentials_target / name).exists():
             raise BundleError('restore target credential already exists: ' + name)

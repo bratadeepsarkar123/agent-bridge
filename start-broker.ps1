@@ -11,7 +11,7 @@ if (Test-Path -LiteralPath $statePath) {
     throw 'Broker state exists but its process could not be verified; inspect it before restarting.'
 }
 $process = Start-Process -FilePath 'C:\Program Files\Python310\python.exe' `
-    -ArgumentList @((Join-Path $PSScriptRoot 'broker.py')) -WorkingDirectory $PSScriptRoot `
+    -ArgumentList @((Join-Path $PSScriptRoot 'broker_launcher.py')) -WorkingDirectory $PSScriptRoot `
     -WindowStyle Hidden -PassThru
 for ($i = 0; $i -lt 50; $i++) {
     if (Test-Path -LiteralPath $statePath) { Write-Output 'Bridge broker started.'; exit 0 }

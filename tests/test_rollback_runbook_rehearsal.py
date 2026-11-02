@@ -27,6 +27,7 @@ class RollbackRunbookRehearsalTests(unittest.TestCase):
             state = root / 'broker-session.json'
             creds = root / 'creds'
             creds.mkdir()
+            credential_store.apply_private_acl(creds, directory=True)
             live = Broker(database)
             credential_store.provision_initial_profile(live, 'alpha', creds)
 

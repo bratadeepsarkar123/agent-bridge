@@ -78,11 +78,11 @@ def stop_marker_path(state):
     fence. fsync/hard-link publication handles ordinary process crashes, not an
     unconditional power-loss guarantee (especially Windows directory metadata).
 
-    ROLLOUT BLOCKER: if finalization cannot publish an inhibit before the process
-    exits, discovery can remain without a marker. The supervisor can then regard
-    that exit as a crash and auto-recover. Refusing a controller stop while still
-    serving does not solve startup/finalization exceptions or subsequent process
-    death. A durable pre-armed recovery policy/independent supervisor protocol is
+    ROLLOUT BLOCKER (narrowed 2026-11-02): a failed marker write no longer lets the
+    broker exit; it keeps serving and retries (see main()). The remaining gap is a
+    process that dies before any marker exists (hard kill, power loss, or an exit
+    before publication succeeds). Discovery can then remain without a marker, and
+    the supervisor can regard that death as a crash and auto-recover. A durable pre-armed recovery policy/independent supervisor protocol is
     required to close this gap; stderr, exit status, or an in-memory flag cannot
     substitute for persistent coordination. Do not deploy this as a complete
     fail-closed stop/recovery protocol until that design is implemented.

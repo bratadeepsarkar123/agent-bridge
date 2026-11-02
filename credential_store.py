@@ -31,6 +31,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import subprocess
 import sys
 import uuid
 
@@ -180,6 +181,81 @@ def read_generation(path):
     return unprotect_token(encrypted)
 
 
+_SYSTEM_SID = '*S-1-5-18'
+_SYSTEM_NAME = 'nt authority\\system'
+_ACE_RE = re.compile(r'(?P<who>.+?):(?P<rights>(?:\([A-Za-z,]+\))+)')
+
+
+def _icacls_path():
+    root = os.environ.get('SystemRoot') or r'C:\Windows'
+    return os.path.join(root, 'System32', 'icacls.exe')
+
+
+def _current_account():
+    """Return (name to grant, bare user name) for the account running this process."""
+    user = os.environ.get('USERNAME') or ''
+    domain = os.environ.get('USERDOMAIN') or ''
+    if not user:
+        raise CredentialStoreError('Windows account name unavailable')
+    return ((domain + '\\' + user) if domain else user), user.lower()
+
+
+def _run_icacls(args):
+    _require_windows()
+    try:
+        return subprocess.run([_icacls_path()] + [str(a) for a in args], capture_output=True,
+                              text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        raise CredentialStoreError('icacls is unavailable') from None
+
+
+def apply_private_acl(path, *, directory):
+    """Remove inherited ACEs and grant only the current account and SYSTEM.
+
+    The caller must pass a path it owns: this changes its ACL. The result is
+    verified before returning. Owner-SID checks are not performed here.
+    """
+    account, _ = _current_account()
+    rights = '(OI)(CI)F' if directory else 'F'
+    result = _run_icacls([path, '/inheritance:r', '/grant:r',
+                          account + ':' + rights, _SYSTEM_SID + ':' + rights])
+    if result.returncode != 0:
+        raise CredentialStoreError('Could not set private ACL')
+    verify_private_acl(path)
+
+
+def verify_private_acl(path):
+    """Fail unless every ACE on path names only the current account or SYSTEM.
+
+    Inherited ACEs are allowed when their principals pass the check; a parent
+    with broad access makes the child fail because its inherited ACEs name other
+    principals. DENY ACEs and any other principal fail closed.
+    """
+    _, user = _current_account()
+    result = _run_icacls([path])
+    if result.returncode != 0:
+        raise CredentialStoreError('Could not read ACL')
+    prefix = str(path)
+    seen_user = False
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith(prefix):
+            line = line[len(prefix):].strip()
+        for match in _ACE_RE.finditer(line):
+            who = match.group('who').strip().lower()
+            rights = match.group('rights').lower()
+            if 'deny' in rights:
+                raise CredentialStoreError('Credential ACL has a DENY entry')
+            if who == _SYSTEM_NAME:
+                continue
+            if who.rsplit('\\', 1)[-1] == user:
+                seen_user = True
+                continue
+            raise CredentialStoreError('Credential ACL grants access to another principal')
+    if not seen_user:
+        raise CredentialStoreError('Credential ACL does not grant the current account')
+
+
 def provision_initial_profile(broker, profile_id, directory):
     """Explicit trusted local admin call; return profile/file metadata, no secret.
 
@@ -192,6 +268,8 @@ def provision_initial_profile(broker, profile_id, directory):
     _require_windows()
     if not broker.valid_id(profile_id):
         raise CredentialStoreError('Invalid profile id')
+    # Fail closed: refuse to write credentials into a directory whose ACL is not private.
+    verify_private_acl(directory)
     try:
         path = Path(directory) / ('credential-' + uuid.uuid4().hex + '.dpapi')
         secret = secrets.token_urlsafe(32).encode('ascii')
