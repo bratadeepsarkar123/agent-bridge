@@ -31,6 +31,13 @@ class FreshSessionLauncherTests(unittest.TestCase):
         self.copy.mkdir()
         # Copy only code: no database, broker state, or credential files.
         shutil.copy2(ROOT / 'launch-claude.ps1', self.copy / 'launch-claude.ps1')
+        launcher = self.copy / 'launch-claude.ps1'
+        script = launcher.read_text(encoding='utf-8')
+        process_query = ('$existing = Get-CimInstance Win32_Process -Filter "name = \'claude.exe\'" |\n'
+                         '    Where-Object { $_.CommandLine -like "*$ClaudeSessionId*" }')
+        if process_query not in script:
+            raise AssertionError('launcher process check changed; update this isolated test stub')
+        launcher.write_text(script.replace(process_query, '$existing = $null'), encoding='utf-8')
         for module in ROOT.glob('*.py'):
             shutil.copy2(module, self.copy / module.name)
         self.database = self.copy / 'broker.sqlite3'

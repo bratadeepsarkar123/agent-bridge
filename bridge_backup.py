@@ -11,6 +11,7 @@ restore_set() restores a set to NEW paths only. It requires:
   - the operator to type the database digest they reviewed (human-confirmed
     freshness check: the newest set must be chosen by a person; see item 6);
   - the pairing check to pass again on the restored copies.
+  - a separate, current database whose retired-hash ledger is authoritative.
 Restore never replaces an existing database or credential file.
 
 Limits: the manifest cannot prove a set is the latest one; that is the human
@@ -85,10 +86,40 @@ def _credential_hashes(directory):
     return found
 
 
-def verify_pairing(database, credentials_dir):
-    """Every credential hash bound in the database must have a file here."""
+def _retired_hashes(database):
+    """Read the durable retired-hash ledger; fail closed for pre-rotation schemas."""
+    uri = Path(database).resolve().as_uri() + '?mode=ro'
+    try:
+        with sqlite3.connect(uri, uri=True) as db:
+            tables = {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'retired_credentials' not in tables:
+                raise BundleError('retired-hash ledger is missing; pairing refused')
+            return {row[0] for row in db.execute(
+                'SELECT token_sha256 FROM retired_credentials')}
+    except sqlite3.Error:
+        raise BundleError('retired-hash ledger is unreadable; pairing refused') from None
+
+
+def verify_pairing(database, credentials_dir, *, retired_database):
+    """Verify a pair and reject bindings or files known to have been retired.
+
+    `retired_database` is mandatory. It supplies the authoritative current ledger
+    when checking a historical backup; checking only a stale set would miss hashes
+    retired after that set was made.
+    """
     bound = _bound_hashes(database)
+    retired = _retired_hashes(database)
+    retired |= _retired_hashes(retired_database)
+    resurrected = bound & retired
+    if resurrected:
+        raise BundleError('retired credential warning: database binds %d retired hash(es)' %
+                          len(resurrected))
     have = _credential_hashes(credentials_dir)
+    retired_files = set(have) & retired
+    if retired_files:
+        raise BundleError('retired credential warning: set contains %d retired credential file(s)' %
+                          len(retired_files))
     missing = bound - set(have)
     if missing:
         raise BundleError('pairing failed: %d bound credential(s) have no matching file' % len(missing))
@@ -116,7 +147,7 @@ def make_set(database, state, credentials_dir, set_dir):
         for source in sorted(Path(credentials_dir).glob(CREDENTIAL_GLOB)):
             _copy_new(source, credentials_out / source.name)
             files[source.name] = _sha256_file(credentials_out / source.name)
-        bound = verify_pairing(db_out, credentials_out)
+        bound = verify_pairing(db_out, credentials_out, retired_database=db_out)
         manifest = {
             'version': VERSION,
             'created_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
@@ -150,8 +181,13 @@ def _read_manifest(set_dir):
     return manifest
 
 
-def restore_set(set_dir, database_target, credentials_target, *, expected_database_sha256):
-    """Restore a verified set to NEW paths. Requires the reviewed digest (item 6)."""
+def restore_set(set_dir, database_target, credentials_target, *, expected_database_sha256,
+                retired_database):
+    """Restore a verified set to NEW paths after checking the current retirement ledger.
+
+    The separate `retired_database` is mandatory: an older backup cannot know
+    about hashes retired after it was made, so checking only the set is unsafe.
+    """
     set_dir = Path(set_dir)
     manifest = _read_manifest(set_dir)
     if expected_database_sha256 != manifest['database']['sha256']:
@@ -165,7 +201,9 @@ def restore_set(set_dir, database_target, credentials_target, *, expected_databa
     for name, digest in manifest['credential_files'].items():
         if _sha256_file(credentials_source / name) != digest:
             raise BundleError('credential digest does not match the manifest: ' + name)
-    verify_pairing(db_source, credentials_source)
+    if Path(retired_database).resolve() == db_source.resolve():
+        raise BundleError('restore needs a separate current retired-hash database')
+    verify_pairing(db_source, credentials_source, retired_database=retired_database)
     database_target = Path(database_target)
     credentials_target = Path(credentials_target)
     if database_target.exists():
@@ -181,6 +219,6 @@ def restore_set(set_dir, database_target, credentials_target, *, expected_databa
     for name in manifest['credential_files']:
         _copy_new(credentials_source / name, credentials_target / name)
     # Verify what was actually written, not what was read.
-    verify_pairing(database_target, credentials_target)
+    verify_pairing(database_target, credentials_target, retired_database=retired_database)
     return {'database': str(database_target), 'credentials': str(credentials_target),
             'bound_credentials': manifest['bound_credentials']}

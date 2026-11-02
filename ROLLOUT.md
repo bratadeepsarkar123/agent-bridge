@@ -161,9 +161,12 @@ Resolve these before a production-like cutover:
    recovery path. Do not rotate in place. Existing profiles need an explicit,
    reviewed rotation design.
 
-   **Status (branch `feature/credential-rotation-design`, not merged):** the design
-   is written in `docs/CREDENTIAL_ROTATION_DESIGN.md`. Rotation is still NOT
-   implemented; the owner decisions listed there are open.
+   **Status (branch `feature/credential-rotation-impl`, implementation worktree):**
+   the rotation journal, retired-hash ledger, compare-and-swap cutover, operator
+   commands, private `retired` file storage, inventory states, and backup restore
+   refusal are implemented in code. The old file is retained with an explicit
+   operator-supplied retention period; nothing deletes it automatically. Windows
+   DPAPI/ACL tests and review remain required before any live migration or rotation.
 
 6. **The launcher cannot provision a fresh Claude identity cleanly.**
    `launch-claude.ps1` generates an ID internally for a new session; if an ID is
@@ -171,19 +174,13 @@ Resolve these before a production-like cutover:
    set session-specific credential environment variables. Add a prepare-then-
    provision-then-launch flow before protecting newly created Claude sessions.
 
-   **Status (branch `feature/launcher-and-client-credentials`, not merged):**
-   `launch-claude.ps1 -FreshSessionId <UUID> -CredentialsDir <DIR>` starts a new
-   session with a supplied UUID. It refuses a non-UUID, a missing folder, or a
-   combination with `-ClaudeSessionId`. It calls `provision_profile.py provision`
-   (broker running: the active token is read from the state file; exit 3 means
-   "unsure, do not retry this ID"). The credential value and file path are never
-   printed. The Claude process gets `BRIDGE_SESSION_CREDENTIAL_FILE` and
-   `BRIDGE_SESSION_CREDENTIAL_FORMAT=dpapi` for that launch only, then the caller's
-   values are restored. `-PrepareOnly` provisions and writes the MCP config but
-   does not launch; it reports variable names only. The resume path and the
-   no-argument path are unchanged. Tests run `-PrepareOnly` against a temp copy
-   only. Still open: the launch branch (credential variables set around the real
-   `claude.exe` call) has not been run in a real process on a disposable copy.
+   **Status (branch `feature/credential-rotation-impl`, implementation worktree):**
+   the existing `-FreshSessionId` flow remains, and `-RotatedSessionId` resumes
+   only a committed or verified rotation during its recorded ISO-8601 window.
+   The launcher checks the journaled hash and file inventory, sets the two
+   credential variables only for that client launch, then restores the caller's
+   values. It records the relaunch only after a successful client exit. Automated
+   tests use a fake client; no real `claude.exe` launch is part of this work.
 
 7. **Some clients only support one credential per process.** `native_worker.py`
    has no credential argument and reads the process environment; the MCP client
@@ -422,9 +419,12 @@ state, credentials_dir, new_set_dir)`. It copies the database with
   copies every `credential-*.dpapi` file, and writes `manifest.json` with digests.
   It refuses unless every credential bound in the database has its file.
 - Restore only to NEW paths with `bridge_backup.restore_set(set_dir,
-new_database, new_credentials_dir, expected_database_sha256=...)`. The
-  expected digest must be typed by a person from the set they reviewed (the
-  newest set). Restore never replaces an existing database or credential file.
+new_database, new_credentials_dir, expected_database_sha256=...,
+retired_database=current_database)`. The separate current database is required:
+it supplies retirement records that an older backup cannot contain. The expected
+digest must be typed by a person from the set they reviewed (the newest set).
+Restore refuses a set whose binding or files contain any hash in that ledger and
+never replaces an existing database or credential file.
 - Keep older sets. Do not overwrite any set.
 - Rollback status: the data half is rehearsed (tests/test_rollback_runbook_rehearsal.py).
   No compatible security-enforcing rollback build exists yet, so an upgrade of the

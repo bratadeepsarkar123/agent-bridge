@@ -23,6 +23,8 @@ commit but before returning may leave a successful binding with an unknown resul
 retry must not overwrite it. No provisioning function is a model MCP tool.
 """
 import ctypes
+from contextlib import closing
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import os
@@ -33,6 +35,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import uuid
 
 
@@ -52,6 +55,34 @@ class CredentialStoreError(Exception):
 
 class GenerationExistsError(CredentialStoreError):
     """A generation already exists and has not been modified."""
+
+
+def parse_rotation_window(value):
+    """Parse an explicit ISO-8601 start/end interval with timezone offsets."""
+    if not isinstance(value, str) or value.count('/') != 1:
+        raise CredentialStoreError('Restart window must be START/END in ISO-8601 with time zones')
+    parts = value.split('/')
+    try:
+        parsed = [datetime.fromisoformat(part[:-1] + '+00:00' if part.endswith('Z') else part)
+                  for part in parts]
+    except ValueError:
+        raise CredentialStoreError('Restart window must be START/END in ISO-8601 with time zones') from None
+    if any(item.tzinfo is None or item.utcoffset() is None for item in parsed):
+        raise CredentialStoreError('Restart window must include time zone offsets')
+    start, end = parsed
+    if end <= start:
+        raise CredentialStoreError('Restart window end must be later than its start')
+    if end.astimezone(timezone.utc).timestamp() <= time.time():
+        raise CredentialStoreError('Restart window has already ended')
+    return start, end
+
+
+def require_open_rotation_window(value):
+    start, end = parse_rotation_window(value)
+    now = time.time()
+    if not start.timestamp() <= now < end.timestamp():
+        raise CredentialStoreError('Rotation must start within its stated restart window')
+    return start, end
 
 
 class _DataBlob(ctypes.Structure):
@@ -358,22 +389,211 @@ def provision_initial_profile(broker, profile_id, directory):
     return {'id': profile_id, 'protected': True, 'credential_file': str(path)}
 
 
+def rotate_profile_credential(broker, profile_id, directory, *, restart_window,
+                              retention_days, _failure_hook=None):
+    """Write one new generation and CAS the bound hash; never retry a rotation.
+
+    `_failure_hook` is test-only crash injection at durable step boundaries. It
+    receives `prepared`, `file_written`, and `committed`; production callers do
+    not pass it.
+    """
+    _require_windows()
+    if not broker.valid_id(profile_id):
+        raise CredentialStoreError('Invalid profile id')
+    if not isinstance(restart_window, str) or not restart_window.strip():
+        raise CredentialStoreError('A stated client restart window is required')
+    require_open_rotation_window(restart_window)
+    if isinstance(retention_days, bool) or not isinstance(retention_days, int) or retention_days < 1:
+        raise CredentialStoreError('Retention days must be a positive integer')
+    directory = Path(directory)
+    verify_private_acl(directory)
+    old_hash = broker.binding_for_profile(profile_id)
+    if old_hash is None:
+        raise ProvisionError('Profile is not bound; use initial provisioning instead')
+
+    old_matches = []
+    for path in sorted(directory.glob('credential-*.dpapi')):
+        try:
+            candidate = read_generation(path)
+        except CredentialStoreError:
+            continue
+        if hashlib.sha256(candidate).hexdigest() == old_hash:
+            old_matches.append(path)
+    if len(old_matches) != 1:
+        raise ProvisionError('The current credential file is missing or ambiguous; nothing was changed')
+
+    rotation_id = uuid.uuid4().hex
+    new_path = directory / ('credential-' + uuid.uuid4().hex + '.dpapi')
+    broker.begin_credential_rotation(rotation_id, profile_id, old_hash,
+                                     old_matches[0].name, new_path.name,
+                                     restart_window, retention_days)
+    if _failure_hook:
+        _failure_hook('prepared')
+
+    secret = secrets.token_urlsafe(32).encode('ascii')
+    token_text = secret.decode('ascii')
+    if not broker.credential_is_available(token_text):
+        raise ProvisionError('Generated credential collides with an existing or retired credential; '
+                             'rotation remains prepared')
+    try:
+        create_generation(new_path, secret)
+        apply_private_acl(new_path, directory=False)
+        verified = read_generation(new_path)
+        _validate_token(verified)
+        if not hmac.compare_digest(secret, verified):
+            raise CredentialStoreError('Credential generation verification failed')
+        broker.mark_rotation_file_written(rotation_id, hashlib.sha256(verified).hexdigest())
+    except CredentialStoreError as exc:
+        exc.credential_file = str(new_path) if new_path.exists() else None
+        raise
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        raise ProvisionError('Could not write and verify the new credential generation',
+                             credential_file=str(new_path) if new_path.exists() else None) from None
+    if _failure_hook:
+        _failure_hook('file_written')
+
+    try:
+        broker.commit_credential_rotation(rotation_id, token_text)
+    except Exception:
+        # A thrown error can follow a successful COMMIT. Read the profile and
+        # journal back; never retry the CAS or create another token here.
+        try:
+            current = broker.binding_for_profile(profile_id)
+            row = broker.rotation_for_profile(profile_id)
+            retired = broker.retired_credential(old_hash)
+        except Exception:
+            current = row = retired = None
+        new_hash = hashlib.sha256(secret).hexdigest()
+        if (current == new_hash and row and row['id'] == rotation_id and
+                row['state'] == 'committed' and retired):
+            pass
+        elif current == old_hash:
+            try:
+                broker.abandon_credential_rotation(rotation_id)
+            except Exception:
+                pass
+            raise ProvisionError('Rotation was not committed; the new encrypted file is an orphan',
+                                 credential_file=str(new_path)) from None
+        elif row and row['id'] == rotation_id and row['state'] == 'abandoned':
+            raise ProvisionError('Profile binding changed; rotation was abandoned and its new file is an orphan',
+                                 credential_file=str(new_path)) from None
+        else:
+            raise ProvisionError('Rotation outcome is unsure. Do not retry blindly.',
+                                 credential_file=str(new_path), unsure=True) from None
+    if _failure_hook:
+        _failure_hook('committed')
+    return {'rotation_id': rotation_id, 'id': profile_id, 'state': 'committed',
+            'new_file': new_path.name, 'restart_window': restart_window.strip(),
+            'retention_days': retention_days}
+
+
+def verify_and_retire_old_generation(broker, profile_id, directory, *, client_check_passed):
+    """Mark a confirmed cutover verified, then move the old file into `retired/`."""
+    _require_windows()
+    if client_check_passed is not True:
+        raise ProvisionError('The operator must confirm the client authorization check')
+    directory = Path(directory)
+    verify_private_acl(directory)
+    rotation = broker.rotation_for_profile(profile_id)
+    if not rotation or rotation['state'] not in ('committed', 'verified'):
+        raise ProvisionError('No committed rotation is awaiting client verification')
+    filename_re = re.compile(r'credential-[0-9a-f]{32}\.dpapi\Z')
+    if (not filename_re.fullmatch(rotation['new_file']) or
+            not filename_re.fullmatch(rotation['old_file'])):
+        raise ProvisionError('Rotation journal has an invalid credential file name')
+    new_path = directory / rotation['new_file']
+    try:
+        verify_private_acl(new_path)
+        token = read_generation(new_path).decode('ascii')
+    except (CredentialStoreError, UnicodeDecodeError):
+        raise ProvisionError('New credential generation is unreadable; rotation remains committed') from None
+    if hashlib.sha256(token.encode('ascii')).hexdigest() != rotation['new_sha256']:
+        raise ProvisionError('New credential generation does not match the journal')
+    try:
+        check = broker.check_session(profile_id, credential=token)
+    except (PermissionError, ValueError):
+        raise ProvisionError('New credential failed the authorization check; rotation remains committed') from None
+    if check.get('id') != profile_id or check.get('kind') not in ('claude', 'codex', 'system'):
+        raise ProvisionError('Authorization check returned an unexpected profile identity')
+    if rotation['state'] == 'committed':
+        broker.mark_rotation_verified(rotation['id'])
+        rotation = broker.rotation_for_profile(profile_id)
+
+    retired_dir = directory / 'retired'
+    try:
+        if not retired_dir.exists():
+            os.mkdir(retired_dir)
+            apply_private_acl(retired_dir, directory=True)
+        else:
+            verify_private_acl(retired_dir)
+    except (OSError, CredentialStoreError):
+        raise ProvisionError('Could not prepare the private retired-credential folder') from None
+
+    destination = retired_dir / rotation['old_file']
+    source = directory / rotation['old_file']
+    if rotation['retired_at'] is None:
+        try:
+            if destination.exists():
+                apply_private_acl(destination, directory=False)
+                old = read_generation(destination)
+                if hashlib.sha256(old).hexdigest() != rotation['old_sha256']:
+                    raise ProvisionError('Retired destination already exists with different contents')
+            else:
+                apply_private_acl(source, directory=False)
+                old = read_generation(source)
+                if hashlib.sha256(old).hexdigest() != rotation['old_sha256']:
+                    raise ProvisionError('Old credential file does not match the journal')
+                os.rename(source, destination)
+                verify_private_acl(destination)
+            # Keep pairing validation on the active set after the move. Backups
+            # consult their own DB plus the authoritative DB at restore time.
+            import bridge_backup
+            bridge_backup.verify_pairing(broker.database, directory,
+                                         retired_database=broker.database)
+            broker.mark_rotation_retired(rotation['id'], 'retired/' + destination.name)
+        except ProvisionError:
+            raise
+        except Exception:
+            raise ProvisionError('Old credential remains recorded as retired; file move needs review') from None
+    return {'id': profile_id, 'state': 'verified', 'retired_file': 'retired/' + destination.name,
+            'retention_days': rotation['retention_days']}
+
+
 def inventory_credential_files(broker, directory):
-    """Read-only report of credential-*.dpapi files: bound, orphan, or unreadable.
+    """Read-only report of active and retired credential generations.
 
     Nothing is written, bound, renamed, or deleted. Orphans and unreadable files
     are reported for an owner decision; this function never decides for them.
     """
     _require_windows()
     verify_private_acl(directory)
+    directory = Path(directory)
+    retired_directory = directory / 'retired'
+    if retired_directory.exists():
+        verify_private_acl(retired_directory)
     report = []
-    for path in sorted(Path(directory).glob('credential-*.dpapi')):
+    paths = sorted(directory.glob('credential-*.dpapi'))
+    if retired_directory.exists():
+        paths.extend(sorted(retired_directory.glob('credential-*.dpapi')))
+    with closing(broker.connect()) as db:
+        rotating = {row['new_sha256']: row['session_id'] for row in db.execute(
+            "SELECT session_id,new_sha256 FROM credential_rotations "
+            "WHERE state IN ('prepared','file_written','committed') AND new_sha256 IS NOT NULL")}
+    for path in paths:
+        relative = path.relative_to(directory).as_posix()
         try:
             token = read_generation(path)
         except CredentialStoreError:
-            report.append({'file': path.name, 'status': 'unreadable', 'profile': None})
+            report.append({'file': relative, 'status': 'unreadable', 'profile': None})
             continue
+        digest = hashlib.sha256(token).hexdigest()
+        retired = broker.retired_credential(digest)
         profile = broker.bound_profile_for_credential(token.decode('ascii'))
-        report.append({'file': path.name, 'status': 'bound' if profile else 'orphan',
-                       'profile': profile})
+        rotating_profile = rotating.get(digest)
+        status = ('retired' if retired else
+                  'rotating' if rotating_profile else
+                  'bound' if profile else 'orphan')
+        report.append({'file': relative, 'status': status,
+                       'profile': profile or rotating_profile or
+                       (retired['session_id'] if retired else None)})
     return report

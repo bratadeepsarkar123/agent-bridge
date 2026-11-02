@@ -38,7 +38,8 @@ class RollbackRunbookRehearsalTests(unittest.TestCase):
             restored_db = root / 'restored.sqlite3'
             restored_creds = root / 'restored-creds'
             bridge_backup.restore_set(root / 'set-1', restored_db, restored_creds,
-                                      expected_database_sha256=manifest['database']['sha256'])
+                                      expected_database_sha256=manifest['database']['sha256'],
+                                      retired_database=database)
 
             # 3. The startup guard accepts the restored schema without migrating it.
             require_current_schema_or_empty(restored_db, require_existing=True)

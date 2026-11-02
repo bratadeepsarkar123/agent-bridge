@@ -84,7 +84,8 @@ class CredentialAclTests(unittest.TestCase):
         existing.mkdir()
         with self.assertRaises(bridge_backup.BundleError):
             bridge_backup.restore_set(self.root / 'set-1', self.root / 'restored.sqlite3', existing,
-                                      expected_database_sha256=manifest['database']['sha256'])
+                                      expected_database_sha256=manifest['database']['sha256'],
+                                      retired_database=database)
         self.assertFalse((self.root / 'restored.sqlite3').exists())
 
 

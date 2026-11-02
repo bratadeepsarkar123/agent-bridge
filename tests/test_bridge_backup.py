@@ -61,18 +61,21 @@ class PairedBackupSetTests(unittest.TestCase):
         target_db = self.root / 'restored.sqlite3'
         target_creds = self.root / 'restored-creds'
         result = bridge_backup.restore_set(self.root / 'set-1', target_db, target_creds,
-                                           expected_database_sha256=manifest['database']['sha256'])
+                                           expected_database_sha256=manifest['database']['sha256'],
+                                           retired_database=self.database)
         self.assertEqual(1, result['bound_credentials'])
         with sqlite3.connect(str(target_db)) as copy:
             self.assertEqual(1, copy.execute('SELECT COUNT(*) FROM session_credentials').fetchone()[0])
-        self.assertEqual(1, bridge_backup.verify_pairing(target_db, target_creds))
+        self.assertEqual(1, bridge_backup.verify_pairing(target_db, target_creds,
+                                                         retired_database=self.database))
 
     def test_restore_refuses_without_the_reviewed_digest(self):
         self.make()
         target_db = self.root / 'restored.sqlite3'
         with self.assertRaises(bridge_backup.BundleError):
             bridge_backup.restore_set(self.root / 'set-1', target_db, self.root / 'restored-creds',
-                                      expected_database_sha256='0' * 64)
+                                      expected_database_sha256='0' * 64,
+                                      retired_database=self.database)
         self.assertFalse(target_db.exists())
 
     def test_restore_detects_a_tampered_credential_file(self):
@@ -82,13 +85,15 @@ class PairedBackupSetTests(unittest.TestCase):
         with self.assertRaises(bridge_backup.BundleError):
             bridge_backup.restore_set(self.root / 'set-1', self.root / 'restored.sqlite3',
                                       self.root / 'restored-creds',
-                                      expected_database_sha256=manifest['database']['sha256'])
+                                      expected_database_sha256=manifest['database']['sha256'],
+                                      retired_database=self.database)
 
     def test_restore_never_replaces_an_existing_database(self):
         manifest = self.make()
         with self.assertRaises(bridge_backup.BundleError):
             bridge_backup.restore_set(self.root / 'set-1', self.database, self.root / 'restored-creds',
-                                      expected_database_sha256=manifest['database']['sha256'])
+                                      expected_database_sha256=manifest['database']['sha256'],
+                                      retired_database=self.database)
 
 
 if __name__ == '__main__':
