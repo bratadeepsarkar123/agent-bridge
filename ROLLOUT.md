@@ -111,20 +111,20 @@ Resolve these before a production-like cutover:
 2. **The staged starter is path-bound.** `start-broker.ps1` recognizes a running
    broker only when its command line contains `agent-bridge-experiment`. It is
    wrong for a staged checkout and must be made path-independent and tested.
-3. **No supported credential provisioning command.** The only provisioning
-   entry point is the Python helper `credential_store.provision_initial_profile`.
-   There is no CLI or operator UI, and no recovery
-   flow that identifies an orphaned credential file after an ambiguous failure.
-   Its caller must create a private directory. A failure after the database
-   commit can leave the caller unsure whether the profile is bound; do not retry
-   blindly.
-4. **Shared-token collision checking depends on broker initialization.** The
-   collision check is populated by `handler_for(broker, token)`. A standalone
-   `Broker(database)` used by the provisioning helper does not load the active
-   shared token into that check. Random token collision is unlikely, but the
-   implementation does not enforce the stated invariant in that provisioning
-   path. Add a broker-owned admin operation or otherwise close this gap before
-   treating provisioning as complete.
+3. **Provisioning CLI added (closed in code on this branch, pending review and a
+   real-process check).** `provision_profile.py` offers `provision`, `check`, and
+   `recover`. `recover` is report-only and never deletes or overwrites a file.
+   A failure after a possible database commit exits 3 and says "unsure, do not
+   retry blindly"; the outcome is confirmed by reading back the token hash. The
+   credentials directory is created private through `credential_store`'s ACL
+   helper and refused if an existing directory is not private.
+4. **Shared-token collision check is loaded on the provisioning path (closed in
+   code on this branch).** `Broker.provision_profile(...)` loads the active shared
+   token into the collision check before it provisions, and the CLI calls only
+   that operation. `handler_for` uses the same `Broker.load_shared_token` method.
+   A standalone `Broker(database)` therefore enforces the invariant on this path.
+   The CLI cannot see a shared token when the broker is stopped, so the check is
+   not loaded in that case (reported in its output).
 5. **Credential rotation is not end-to-end.** The file helper provisions only
    an unbound profile with `replace=False`. The lower-level broker method can
    replace a hash, but there is no coordinated generation/file/client cutover or
@@ -190,9 +190,10 @@ duplicate. Do not treat no-ID direct sends as retry-safe.
 
 ## Initial credential provisioning
 
-This is the intended manual sequence for the staged API, **not a supported
-operator command yet**. Use it only after the provisioning and shutdown gates
-are resolved and the staged broker code is the reviewed release.
+This is the intended manual sequence for the staged API. The provisioning CLI
+(`provision_profile.py`) exists on this branch, but **the rollout is still
+blocked** by the shutdown and other gates. Use this sequence only after those
+gates are resolved and the staged broker code is the reviewed release.
 
 1. Stop all bridge services through the reviewed stop helper. Do not kill an
    individual worker while the guard is active. Broker restart does not restart
@@ -219,41 +220,30 @@ are resolved and the staged broker code is the reviewed release.
    environment variable, log, or checked-in file. The environment variables
    below contain only a file path and format.
 
-3. With the broker stopped, call the local provisioning API against the exact
-   broker database path. For example, after the code gates are resolved:
+3. With the broker stopped, provision the profile with the supported CLI from
+   the reviewed release directory. The CLI reads the active shared token from
+   `broker-session.json` when it exists; when the broker is stopped that file is
+   absent and the output reports `shared_token_checked: false`:
 
    ```powershell
-   $env:BRIDGE_CREDENTIAL_DIR = 'C:\Users\<user>\AppData\Local\AgentBridge\credentials'
-   $env:BRIDGE_PROFILE_ID = '<configured-profile-id>'
-   @'
-   import json, os
-   from pathlib import Path
-   from broker import Broker
-   from credential_store import provision_initial_profile
-
-   database = Path.cwd() / 'broker.sqlite3'
-   if not database.is_file():
-       raise SystemExit('broker.sqlite3 is missing from the reviewed release directory')
-   result = provision_initial_profile(
-       Broker(database),
-       os.environ['BRIDGE_PROFILE_ID'],
-       os.environ['BRIDGE_CREDENTIAL_DIR'],
-   )
-   print(json.dumps(result, sort_keys=True))
-   '@ | python -B -
+   python -B provision_profile.py provision '<configured-profile-id>' `
+       --credentials-dir "$env:LOCALAPPDATA\AgentBridge\credentials"
    ```
 
-   Run from the reviewed release directory so the database path is unambiguous.
-   The helper generates the token in-process, writes a user-bound DPAPI file,
-   verifies the file, and stores only its hash in the broker database. The
-   printed result contains the profile ID and credential-file path, not the
-   token. `Broker(...)` runs schema setup, which is another reason to run only
-   with the broker stopped and against the intended database.
+   `provision` creates a NEW credentials directory with a private ACL, or
+   verifies an existing one and refuses it if it is not private. It refuses a
+   profile that is already bound, and a token that collides with the loaded
+   shared token, before writing anything. The helper generates the token
+   in-process, writes a user-bound DPAPI file, verifies it, and stores only its
+   hash. Output contains the profile ID and credential-file path, never the token.
 
-4. If the command reports any error or the result is uncertain, stop. Do not
-   retry for the same profile: an encrypted orphan or a committed binding may
-   exist. The current code has no safe reconciliation command. Resolve this with
-   a reviewed admin tool before proceeding.
+4. If `provision` exits 3 ("unsure"), stop and do not retry. The binding may be
+   committed. Run `python -B provision_profile.py check '<profile-id>'` to see
+   whether the profile is bound, and `recover --credentials-dir <dir>` to list
+   each credential file as bound, orphan, or unreadable. `recover` is read-only:
+   it never binds, overwrites, or deletes a file. An orphan is an owner decision.
+   If `provision` exits 1, the profile was not bound; a kept orphan file is
+   listed in the message and is never deleted automatically.
 5. Configure only the intended client process to read that file:
 
    ```powershell

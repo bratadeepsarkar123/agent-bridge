@@ -256,13 +256,62 @@ def verify_private_acl(path):
         raise CredentialStoreError('Credential ACL does not grant the current account')
 
 
+UNSURE_MESSAGE = ('Provisioning outcome is unsure: the profile may already be bound. '
+                  'Do not retry blindly. Check the profile and review the credential file.')
+
+
+class ProvisionError(CredentialStoreError):
+    """Provisioning did not complete. unsure=True means the binding may have committed.
+
+    credential_file names an encrypted file that was kept (never deleted) when one
+    was created; it is an orphan unless its profile is bound.
+    """
+
+    def __init__(self, message, *, credential_file=None, unsure=False):
+        super().__init__(message)
+        self.credential_file = credential_file
+        self.unsure = unsure
+
+
+def prepare_credentials_directory(path):
+    """Create a NEW credentials directory with a private ACL, or verify an existing one.
+
+    Fails closed: an existing directory must already be private (it is never
+    re-permissioned here), and a directory whose private ACL cannot be applied is
+    removed only if it is still empty, which this function just created.
+    """
+    _require_windows()
+    path = Path(path)
+    if path.exists():
+        if not path.is_dir():
+            raise CredentialStoreError('Credentials path is not a directory')
+        verify_private_acl(path)
+        return
+    try:
+        os.mkdir(path)
+    except OSError:
+        raise CredentialStoreError('Could not create credentials directory') from None
+    try:
+        apply_private_acl(path, directory=True)
+    except CredentialStoreError:
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+        raise
+
+
 def provision_initial_profile(broker, profile_id, directory):
     """Explicit trusted local admin call; return profile/file metadata, no secret.
 
-    The caller selects the profile and private directory. Generate one unique
-    immutable file, verify its token, then atomically bind with replace=False.
-    Concurrent losers retain at most one orphan encrypted file each. No file is
-    deleted or overwritten, and existing credential bindings are never replaced.
+    The caller selects the profile and private directory. Refuses before writing
+    anything when the profile is already bound or the generated token collides
+    with a loaded shared token or an existing binding. Otherwise it creates and
+    verifies one immutable file, then binds with replace=False. A failure before
+    the binding leaves the encrypted file as an orphan and raises ProvisionError.
+    A failure after a possible commit is confirmed by reading back the token hash;
+    if it is bound or cannot be checked, ProvisionError(unsure=True) is raised and
+    the caller must not retry blindly. No file is deleted or overwritten.
     Same-user processes can decrypt; this authenticates no actual thread identity.
     """
     _require_windows()
@@ -270,15 +319,61 @@ def provision_initial_profile(broker, profile_id, directory):
         raise CredentialStoreError('Invalid profile id')
     # Fail closed: refuse to write credentials into a directory whose ACL is not private.
     verify_private_acl(directory)
+    path = None
     try:
+        if broker.profile_status(profile_id)['bound']:
+            raise ProvisionError('Profile already has a credential; nothing was written')
         path = Path(directory) / ('credential-' + uuid.uuid4().hex + '.dpapi')
         secret = secrets.token_urlsafe(32).encode('ascii')
+        if not broker.credential_is_available(secret.decode('ascii')):
+            raise ProvisionError('Generated credential collides with a loaded or bound '
+                                 'credential; nothing was written')
         create_generation(path, secret)
         verified = read_generation(path)
         _validate_token(verified)
         if not hmac.compare_digest(secret, verified):
             raise CredentialStoreError('Credential generation verification failed')
-        broker.provision_session_credential(profile_id, secret.decode('ascii'), replace=False)
+    except ProvisionError:
+        raise
+    except CredentialStoreError as exc:
+        # Keep the sanitized type callers already match on; record any kept file.
+        exc.credential_file = None if path is None else str(path)
+        raise
     except (OSError, ValueError, TypeError, sqlite3.Error):
-        raise CredentialStoreError('Could not provision initial profile') from None
+        raise ProvisionError('Could not provision initial profile',
+                             credential_file=None if path is None else str(path)) from None
+    token_text = secret.decode('ascii')
+    try:
+        broker.provision_session_credential(profile_id, token_text, replace=False)
+    except Exception:
+        # Read back the candidate's unique hash: present means the commit happened.
+        try:
+            committed = broker.credential_is_valid(token_text)
+        except Exception:
+            committed = None
+        if committed is False:
+            raise ProvisionError('Could not provision initial profile',
+                                 credential_file=str(path)) from None
+        raise ProvisionError(UNSURE_MESSAGE, credential_file=str(path), unsure=True) from None
     return {'id': profile_id, 'protected': True, 'credential_file': str(path)}
+
+
+def inventory_credential_files(broker, directory):
+    """Read-only report of credential-*.dpapi files: bound, orphan, or unreadable.
+
+    Nothing is written, bound, renamed, or deleted. Orphans and unreadable files
+    are reported for an owner decision; this function never decides for them.
+    """
+    _require_windows()
+    verify_private_acl(directory)
+    report = []
+    for path in sorted(Path(directory).glob('credential-*.dpapi')):
+        try:
+            token = read_generation(path)
+        except CredentialStoreError:
+            report.append({'file': path.name, 'status': 'unreadable', 'profile': None})
+            continue
+        profile = broker.bound_profile_for_credential(token.decode('ascii'))
+        report.append({'file': path.name, 'status': 'bound' if profile else 'orphan',
+                       'profile': profile})
+    return report

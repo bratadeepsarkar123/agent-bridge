@@ -56,6 +56,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import credential_store
+
 ROOT = Path(__file__).resolve().parent
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 MAX_GROUP_RECIPIENTS = 100
@@ -364,6 +366,61 @@ class Broker:
         with closing(self.connect()) as db:
             return db.execute('SELECT 1 FROM session_credentials WHERE token_sha256=?',
                               (digest,)).fetchone() is not None
+
+    def credential_is_available(self, credential):
+        """True only when credential is neither a loaded shared token nor bound."""
+        digest = self._credential_hash(credential)
+        if digest in self._shared_token_hashes:
+            return False
+        with closing(self.connect()) as db:
+            return db.execute('SELECT 1 FROM session_credentials WHERE token_sha256=?',
+                              (digest,)).fetchone() is None
+
+    def bound_profile_for_credential(self, credential):
+        """Admin read: return the profile ID bound to this credential, or None."""
+        digest = self._credential_hash(credential)
+        with closing(self.connect()) as db:
+            row = db.execute('SELECT session_id FROM session_credentials WHERE token_sha256=?',
+                             (digest,)).fetchone()
+        return None if row is None else row['session_id']
+
+    def profile_status(self, profile_id):
+        """Admin read: whether a profile is bound and opted in. Returns no secret."""
+        if not self.valid_id(profile_id):
+            raise ValueError('invalid session id')
+        with closing(self.connect()) as db, db:
+            bound = db.execute('SELECT 1 FROM session_credentials WHERE session_id=?',
+                               (profile_id,)).fetchone() is not None
+            row = db.execute('SELECT opted_in FROM sessions WHERE id=?', (profile_id,)).fetchone()
+        return {'id': profile_id, 'bound': bound, 'opted_in': bool(row and row['opted_in'])}
+
+    def load_shared_token(self, token):
+        """Admit the active shared bearer into this instance's collision check.
+
+        Refuses when the token already equals a session credential in the database.
+        Later session provisioning on this instance then refuses the same token.
+        """
+        if not isinstance(token, str) or not token:
+            raise ValueError('shared token must be a non-empty string')
+        shared_digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT 1 FROM session_credentials WHERE token_sha256=?',
+                          (shared_digest,)).fetchone():
+                raise ValueError('shared token conflicts with a session credential')
+            self._shared_token_hashes.add(shared_digest)
+
+    def provision_profile(self, profile_id, credentials_dir, *, active_shared_token):
+        """Admin-only broker operation: provision one new profile credential.
+
+        active_shared_token is the running broker's shared bearer, or None when no
+        broker is running and therefore no active token exists. It is loaded into
+        the collision check before anything is written, so a generated credential
+        equal to it is refused and no file is created.
+        """
+        if active_shared_token is not None:
+            self.load_shared_token(active_shared_token)
+        return credential_store.provision_initial_profile(self, profile_id, credentials_dir)
 
     def register(self, data, *, credential=None):
         ident, kind = data.get('id'), data.get('kind')
@@ -956,13 +1013,7 @@ class DrainingHTTPServer(ThreadingHTTPServer):
 
 
 def handler_for(broker, token):
-    shared_digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
-    with closing(broker.connect()) as db, db:
-        db.execute('BEGIN IMMEDIATE')
-        if db.execute('SELECT 1 FROM session_credentials WHERE token_sha256=?',
-                      (shared_digest,)).fetchone():
-            raise ValueError('shared token conflicts with a session credential')
-        broker._shared_token_hashes.add(shared_digest)
+    broker.load_shared_token(token)
     class Handler(BaseHTTPRequestHandler):
         def handle_one_request(self):
             # Parse headers before rejection: closing a socket with unread HTTP
