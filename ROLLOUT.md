@@ -72,7 +72,7 @@ Resolve these before a production-like cutover:
    the staged starter, the Claude recovery launcher, and supervisor recovery all
    start the broker through `broker_launcher.py`, so each holds the control pipe.
    This still does not coordinate the service guard or the supervisor process
-   itself. After successful stop-marker
+   itself (the stop-request channel for both is described in the status below). After successful stop-marker
    publication, the recovery fence blocks supervisor auto-recovery while the
    marker remains, including after a failed drain. If marker publication fails,
    drain is refused and the broker keeps serving, retrying the marker with
@@ -80,8 +80,8 @@ Resolve these before a production-like cutover:
    kill before publication remains a plain crash. New connections can also
    extend the drain. A failed drain does not get a second drain wait, while
    successful drain may still need final bounded server/process cleanup.
-   `service_guard.py` and `supervisor.py` still have no coordinated stop control.
-   Force-stopping a child can cause it to respawn; force-stopping a parent can
+   `service_guard.py` and `supervisor.py` have no coordinated stop control in the
+   broker drain. Force-stopping a child can cause it to respawn; force-stopping a parent can
    skip its `finally` cleanup and leave lock files. A reviewed service-level
    helper must stop the guard first, stop the supervisor, request the broker
    drain, stop remaining children in order, and confirm cleanup. Until then, a
@@ -90,11 +90,23 @@ Resolve these before a production-like cutover:
    **Status (branch `feature/service-stop-helper`, not merged):** `service_stop.py`
    implements this order with `stop` and `restart` subcommands, `--dry-run` and
    `--root`. `tests/test_service_stop.py` covers it with injected fakes only; it
-   has not been run against real processes. Open: `service_guard.py` and
-   `supervisor.py` still have no graceful stop channel. On Windows the helper's
-   exit request is a non-forced `taskkill`, which may not stop a windowless
-   process; a live stop would then fail at step 1 and nothing is force-killed.
-   Live use stays blocked until a real stop channel is verified on a process.
+   has not been run against real processes.
+
+   **Guard and supervisor stop channel (branch `feature/graceful-guard-supervisor-stop`):**
+   `service_guard.py` checks for `service-guard.stop-request` before each pass and
+   while it sleeps (in 1 s slices). On a request it consumes the file and exits its
+   loop without spawning anything; it never signals its children. `supervisor.py`
+   does the same with `supervisor.stop-request`, checked before each pass and again
+   just before any recovery launch, so a stop cannot start a recovery. It never
+   writes to or removes the discovery state, the stop-pending marker or the
+   recovery lock. `service_stop.py` writes the request file for the guard and the
+   supervisor, then waits with the same bounded timeout. A process that does not
+   exit is reported as a failed step. It is not force-killed, and the request file
+   stays so the process can still exit on its next check. A leftover request file
+   fails the cleanup check. Tests use fakes and temp folders only. Still open: on
+   Windows, the children's exit request is a non-forced `taskkill`, which may not
+   stop a windowless process. Live use stays blocked until a real process has been
+   stopped this way on a disposable copy.
 
 2. **The staged starter is path-bound.** `start-broker.ps1` recognizes a running
    broker only when its command line contains `agent-bridge-experiment`. It is

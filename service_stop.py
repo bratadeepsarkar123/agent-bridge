@@ -7,10 +7,14 @@ in config order; (5) cleanup check: no live guard, supervisor, broker, or
 child process, and no discovery state, stop-pending marker or stop request
 left behind.
 
-Nothing is force-killed. Each process gets one graceful exit request and is
-then waited on. A process that does not exit is a failed step, and the run
-stops there. A failed drain is not retried. Restart runs the same stop, and
-starts broker, supervisor, then guard only after the stop is confirmed.
+The guard and supervisor are stopped by a stop-request file in the bridge
+root (service-guard.stop-request, supervisor.stop-request); each one consumes
+its file and exits its loop without recovery or child launches. Children get
+one non-forced exit request. Every step is waited on with a bounded timeout.
+
+Nothing is force-killed. A process that does not exit is a failed step, and
+the run stops there. A failed drain is not retried. Restart runs the same
+stop, and starts broker, supervisor, then guard only after the stop is confirmed.
 """
 
 from __future__ import annotations
@@ -38,6 +42,9 @@ SUPERVISOR_LOCK = 'supervisor-session.json'
 BROKER_STATE = 'broker-session.json'
 STOP_PENDING = 'broker-session.json.stop-pending'
 STOP_REQUEST = 'broker-stop-request'
+# Must match service_guard.STOP_REQUEST and supervisor.STOP_REQUEST (tests check this).
+GUARD_STOP_REQUEST = 'service-guard.stop-request'
+SUPERVISOR_STOP_REQUEST = 'supervisor.stop-request'
 # Persistent by design: these are never unlinked, so their presence is expected.
 PERSISTENT_LOCKS = (
     'broker-session.json.recovery-lock',
@@ -68,6 +75,7 @@ class Controls:
     is_alive: Callable[[int], bool]
     command_line: Callable[[int], Optional[str]]
     request_exit: Callable[[int], None]
+    write_stop_request: Callable[[Path], None]
     drain_broker: Callable[[Path, float], int]
     start_process: Callable[[list, Path], Any]
     sleep: Callable[[float], None]
@@ -116,6 +124,16 @@ def _default_request_exit(pid: int) -> None:
     os.kill(pid, signal.SIGINT)
 
 
+def _default_write_stop_request(path: Path) -> None:
+    """Create a stop-request file once. An existing file already asks for the stop."""
+    try:
+        fd = os.open(os.fspath(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return
+    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+        stream.write('stop\n')
+
+
 def _default_drain_broker(root: Path, timeout: float) -> int:
     return stop_broker(root=root, timeout=timeout)
 
@@ -134,6 +152,7 @@ def default_controls() -> Controls:
         is_alive=_default_is_alive,
         command_line=_default_command_line,
         request_exit=_default_request_exit,
+        write_stop_request=_default_write_stop_request,
         drain_broker=_default_drain_broker,
         start_process=_default_start_process,
         sleep=time.sleep,
@@ -175,20 +194,21 @@ def _wait_for_exit(controls: Controls, pid: int, timeout: float, poll: float = 0
     return not _alive(controls, pid)
 
 
-def _stop_process(controls: Controls, pid: int, script: str, exit_timeout: float) -> Optional[str]:
-    """Request a graceful exit of one verified process. Return None or a failure reason."""
+def _stop_process(controls: Controls, pid: int, script: str, exit_timeout: float,
+                  ask: Callable[[], None], how: str) -> Optional[str]:
+    """Verify one process, make one graceful request via ask(), then wait. Return None or a failure reason."""
     command = controls.command_line(pid)
     if command is None:
         return f'cannot verify that pid {pid} is {script}; refusing to signal it'
     if not _is_script(command, script):
         return f'pid {pid} is not {script}; refusing to signal it'
     try:
-        controls.request_exit(pid)
+        ask()
     except OSError as exc:
-        return f'could not request exit of {script} (pid {pid}): {type(exc).__name__}'
+        return f'could not make {how} for {script} (pid {pid}): {type(exc).__name__}'
     if _wait_for_exit(controls, pid, exit_timeout):
         return None
-    return (f'{script} (pid {pid}) did not exit within {exit_timeout:g} s; '
+    return (f'{script} (pid {pid}) did not exit within {exit_timeout:g} s after {how}; '
             'not force-killed, so later steps were not run')
 
 
@@ -228,7 +248,7 @@ class Stopper:
         self.say('Stop confirmed: all steps passed.')
         return True
 
-    def _stop_lock_owner(self, name: str, lock: str, script: str) -> Step:
+    def _stop_lock_owner(self, name: str, lock: str, script: str, request: str) -> Step:
         kind, pid = _pid_from(self.controls, self.root / lock)
         if kind == 'absent':
             return Step(name, OK, 'not running (no lock file)')
@@ -236,16 +256,19 @@ class Stopper:
             return Step(name, FAILED, f'{lock} is unreadable or has no valid pid; refusing to act on it')
         if not _alive(self.controls, pid):
             return Step(name, OK, f'pid {pid} is not running; stale lock left for the cleanup check')
-        problem = _stop_process(self.controls, pid, script, self.exit_timeout)
+        problem = _stop_process(
+            self.controls, pid, script, self.exit_timeout,
+            lambda: self.controls.write_stop_request(self.root / request),
+            'a stop-request file')
         if problem:
             return Step(name, FAILED, problem)
-        return Step(name, OK, f'{script} (pid {pid}) exited after a graceful request')
+        return Step(name, OK, f'{script} (pid {pid}) exited after a stop request')
 
     def _guard(self) -> Step:
-        return self._stop_lock_owner('guard', GUARD_LOCK, 'service_guard.py')
+        return self._stop_lock_owner('guard', GUARD_LOCK, 'service_guard.py', GUARD_STOP_REQUEST)
 
     def _supervisor(self) -> Step:
-        return self._stop_lock_owner('supervisor', SUPERVISOR_LOCK, 'supervisor.py')
+        return self._stop_lock_owner('supervisor', SUPERVISOR_LOCK, 'supervisor.py', SUPERVISOR_STOP_REQUEST)
 
     def _drain(self) -> Step:
         kind, pid = _pid_from(self.controls, self.root / BROKER_STATE)
@@ -298,7 +321,8 @@ class Stopper:
             self.child_pids.append((script, pid))
             if not _alive(self.controls, pid):
                 continue
-            problem = _stop_process(self.controls, pid, script, self.exit_timeout)
+            problem = _stop_process(self.controls, pid, script, self.exit_timeout,
+                                    lambda: self.controls.request_exit(pid), 'a graceful exit request')
             if problem:
                 return Step('children', FAILED, problem)
             stopped += 1
@@ -326,6 +350,9 @@ class Stopper:
             problems.append(f'{STOP_PENDING} is present; operator recovery is needed before any start')
         if (self.root / STOP_REQUEST).exists():
             problems.append(f'{STOP_REQUEST} is still present')
+        for request in (GUARD_STOP_REQUEST, SUPERVISOR_STOP_REQUEST):
+            if (self.root / request).exists():
+                problems.append(f'{request} is still present; its process did not consume it')
         for script, pid in self.child_pids:
             if _alive(self.controls, pid):
                 problems.append(f'child {script} (pid {pid}) is still running')
@@ -384,8 +411,8 @@ def describe_plan(root: Path, services_config: Optional[Path], restart: bool) ->
     lines = [
         'Dry run: nothing will be signalled, drained or started.',
         f'Root: {root}',
-        '1. guard: read service-guard.json; verify it is service_guard.py; request a graceful exit; wait',
-        '2. supervisor: read supervisor-session.json; verify it is supervisor.py; request a graceful exit; wait',
+        '1. guard: read service-guard.json; verify it is service_guard.py; write service-guard.stop-request; wait',
+        '2. supervisor: read supervisor-session.json; verify it is supervisor.py; write supervisor.stop-request; wait',
         '3. broker drain: read broker-session.json pid only; verify broker.py; one drain request via broker_stop.py',
     ]
     if services_config is None:

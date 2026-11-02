@@ -13,6 +13,8 @@ SUPERVISOR_PID = 4002
 BROKER_PID = 4003
 CHILD_A_PID = 5001
 CHILD_B_PID = 5002
+REQUEST_PIDS = {service_stop.GUARD_STOP_REQUEST: GUARD_PID,
+                service_stop.SUPERVISOR_STOP_REQUEST: SUPERVISOR_PID}
 
 
 class FakeWorld:
@@ -27,6 +29,8 @@ class FakeWorld:
         self.calls = []
         self.started = []
         self.start_exit_code = None
+        self.request_error = None
+        self.sleeps = []
 
     def add_process(self, pid, command, exits=True):
         self.running.add(pid)
@@ -41,6 +45,18 @@ class FakeWorld:
         self.calls.append(('exit', pid))
         if pid in self.exits_on_request:
             self.running.discard(pid)
+
+    def _write_stop_request(self, path):
+        """Fake a stop-request file. A process that consumes it exits and removes the file."""
+        self.calls.append(('request', path.name))
+        if self.request_error is not None:
+            raise self.request_error
+        if not path.exists():
+            path.write_text('stop\n', encoding='utf-8')
+        pid = REQUEST_PIDS[path.name]
+        if pid in self.exits_on_request and pid in self.running:
+            self.running.discard(pid)
+            path.unlink(missing_ok=True)
 
     def _drain(self, root, timeout):
         self.calls.append(('drain', timeout))
@@ -65,9 +81,10 @@ class FakeWorld:
             is_alive=lambda pid: pid in self.running,
             command_line=lambda pid: self.commands.get(pid),
             request_exit=self._request_exit,
+            write_stop_request=self._write_stop_request,
             drain_broker=self._drain,
             start_process=self._start,
-            sleep=lambda seconds: None,
+            sleep=lambda seconds: self.sleeps.append(seconds),
         )
 
 
@@ -112,8 +129,8 @@ class ServiceStopTests(unittest.TestCase):
         config = write_services(self.root)
         stopper = Stopper(self.root, world.controls(), services_config=config, say=self.say)
         self.assertTrue(stopper.run())
-        self.assertEqual([('exit', GUARD_PID), ('exit', SUPERVISOR_PID), ('drain', 120.0),
-                          ('exit', CHILD_A_PID), ('exit', CHILD_B_PID)], world.calls)
+        self.assertEqual([('request', 'service-guard.stop-request'), ('request', 'supervisor.stop-request'),
+                          ('drain', 120.0), ('exit', CHILD_A_PID), ('exit', CHILD_B_PID)], world.calls)
         self.assertEqual(['ok', 'ok', 'ok', 'ok', 'ok'], [step.status for step in stopper.steps])
         self.assertIn('Stop confirmed', self.lines[-1])
 
@@ -129,6 +146,7 @@ class ServiceStopTests(unittest.TestCase):
             is_alive=lambda pid: pid in world.running,
             command_line=lambda pid: world.commands.get(pid),
             request_exit=forbidden,
+            write_stop_request=forbidden,
             drain_broker=forbidden,
             start_process=forbidden,
             sleep=forbidden,
@@ -148,7 +166,7 @@ class ServiceStopTests(unittest.TestCase):
         stopper = Stopper(self.root, world.controls(), exit_timeout=1, say=self.say)
         self.assertFalse(stopper.run())
         self.assertEqual('failed', stopper.steps[0].status)
-        self.assertEqual([('exit', GUARD_PID)], world.calls)
+        self.assertEqual([('request', 'service-guard.stop-request')], world.calls)
         self.assertTrue(any('[not run] 2. supervisor' in line for line in self.lines))
         self.assertIn('Stop FAILED at step 1 (guard)', self.lines[-1])
 
@@ -267,6 +285,78 @@ class ServiceStopTests(unittest.TestCase):
         stopper_ok = main(['restart', '--root', str(self.root)], controls=world.controls(), say=self.say)
         self.assertEqual(0, stopper_ok)
         self.assertTrue(any('guard was NOT started' in line for line in self.lines))
+
+    def test_guard_timeout_is_bounded_reported_and_never_force_killed(self):
+        world = healthy_world(self.root)
+        world.exits_on_request.discard(GUARD_PID)
+        stopper = Stopper(self.root, world.controls(), exit_timeout=1, say=self.say)
+        self.assertFalse(stopper.run())
+        step = stopper.steps[0]
+        self.assertEqual('failed', step.status)
+        self.assertIn('did not exit within 1 s', step.detail)
+        self.assertIn('not force-killed', step.detail)
+        # Only the request file was used: no exit or kill-style call for the guard.
+        self.assertFalse(any(call[0] == 'exit' and call[1] == GUARD_PID for call in world.calls))
+        self.assertIn(GUARD_PID, world.running)
+        self.assertTrue((self.root / 'service-guard.stop-request').exists())
+        self.assertLessEqual(sum(world.sleeps), 1.5)
+        self.assertEqual([('request', 'service-guard.stop-request')], world.calls)
+        self.assertNotIn(('drain', 120.0), world.calls)
+
+    def test_supervisor_timeout_stops_run_before_broker_drain(self):
+        world = healthy_world(self.root)
+        world.exits_on_request.discard(SUPERVISOR_PID)
+        stopper = Stopper(self.root, world.controls(), exit_timeout=1, say=self.say)
+        self.assertFalse(stopper.run())
+        self.assertEqual('ok', stopper.steps[0].status)
+        self.assertEqual('failed', stopper.steps[1].status)
+        self.assertIn('did not exit within 1 s', stopper.steps[1].detail)
+        self.assertIn(SUPERVISOR_PID, world.running)
+        self.assertTrue((self.root / 'supervisor.stop-request').exists())
+        self.assertNotIn(('exit', SUPERVISOR_PID), world.calls)
+        self.assertNotIn(('drain', 120.0), world.calls)
+        self.assertIn('[not run] 3. broker drain', self.lines)
+
+    def test_request_write_error_is_reported_and_nothing_else_runs(self):
+        world = healthy_world(self.root)
+        world.request_error = PermissionError('denied')
+        stopper = Stopper(self.root, world.controls(), exit_timeout=1, say=self.say)
+        self.assertFalse(stopper.run())
+        self.assertEqual('failed', stopper.steps[0].status)
+        self.assertIn('could not make a stop-request file', stopper.steps[0].detail)
+        self.assertIn('PermissionError', stopper.steps[0].detail)
+        self.assertEqual([('request', 'service-guard.stop-request')], world.calls)
+        self.assertEqual([], world.sleeps)
+
+    def test_clean_stop_consumes_request_files(self):
+        world = healthy_world(self.root)
+        config = write_services(self.root)
+        stopper = Stopper(self.root, world.controls(), services_config=config, say=self.say)
+        self.assertTrue(stopper.run())
+        self.assertFalse((self.root / 'service-guard.stop-request').exists())
+        self.assertFalse((self.root / 'supervisor.stop-request').exists())
+
+    def test_leftover_guard_request_fails_cleanup(self):
+        world = healthy_world(self.root)
+        stopper = Stopper(self.root, world.controls(), say=self.say)
+        self.assertTrue(stopper.run())
+        (self.root / 'service-guard.stop-request').write_text('stop\n', encoding='utf-8')
+        cleanup = stopper._cleanup()
+        self.assertEqual('failed', cleanup.status)
+        self.assertIn('service-guard.stop-request is still present', cleanup.detail)
+
+    def test_default_request_write_is_exclusive_and_idempotent(self):
+        path = self.root / 'supervisor.stop-request'
+        service_stop._default_write_stop_request(path)
+        service_stop._default_write_stop_request(path)  # second call: already requested, no error
+        self.assertEqual('stop\n', path.read_text(encoding='utf-8'))
+        self.assertEqual(['supervisor.stop-request'], [p.name for p in self.root.iterdir()])
+
+    def test_request_names_match_the_guard_and_supervisor_modules(self):
+        import service_guard
+        import supervisor
+        self.assertEqual(service_guard.STOP_REQUEST.name, service_stop.GUARD_STOP_REQUEST)
+        self.assertEqual(supervisor.STOP_REQUEST.name, service_stop.SUPERVISOR_STOP_REQUEST)
 
 
 if __name__ == '__main__':
