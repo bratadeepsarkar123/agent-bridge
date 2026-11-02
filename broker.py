@@ -5,12 +5,11 @@ must stay in a directory accessible only to the local user. Acknowledgement is
 explicit: an HTTP success means queued, not that an agent read the message.
 
 Staged session credential contract:
-* Local administrators call Broker.provision_session_credential(id, token) with a
-  separately generated secrets.token_urlsafe(32) value. It reserves/protects the
-  profile before registration, rotates on repeat calls, stores only SHA-256, and
-  returns no secret. There is deliberately no HTTP or model MCP provisioning API.
-  Passing replace=False atomically requires an absent binding; the default
-  replace=True preserves explicit local rotation semantics.
+* Local administrators provision a first credential through `provision_profile`.
+  `provision_session_credential` is a low-level bind/replace helper and refuses
+  retired hashes. The supported rotation path uses a journaled compare-and-swap
+  transaction that also records the retired hash. There is deliberately no HTTP
+  or model MCP provisioning API.
 * HTTP Authorization: Bearer <shared-token> retains legacy access to unprotected
   actors. Authorization: Bearer <session-token> acts only as its protected profile.
   No body/query token or identity fallback is accepted. Failures are HTTP 403 with
@@ -56,8 +55,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import credential_store
+
 ROOT = Path(__file__).resolve().parent
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+SCHEMA_VERSION = 2
 MAX_GROUP_RECIPIENTS = 100
 MAX_ROOM_MEMBERS = 100
 MAX_ROOM_NAME = 120
@@ -78,11 +80,11 @@ def stop_marker_path(state):
     fence. fsync/hard-link publication handles ordinary process crashes, not an
     unconditional power-loss guarantee (especially Windows directory metadata).
 
-    ROLLOUT BLOCKER: if finalization cannot publish an inhibit before the process
-    exits, discovery can remain without a marker. The supervisor can then regard
-    that exit as a crash and auto-recover. Refusing a controller stop while still
-    serving does not solve startup/finalization exceptions or subsequent process
-    death. A durable pre-armed recovery policy/independent supervisor protocol is
+    ROLLOUT BLOCKER (narrowed 2026-11-02): a failed marker write no longer lets the
+    broker exit; it keeps serving and retries (see main()). The remaining gap is a
+    process that dies before any marker exists (hard kill, power loss, or an exit
+    before publication succeeds). Discovery can then remain without a marker, and
+    the supervisor can regard that death as a crash and auto-recover. A durable pre-armed recovery policy/independent supervisor protocol is
     required to close this gap; stderr, exit status, or an in-memory flag cannot
     substitute for persistent coordination. Do not deploy this as a complete
     fail-closed stop/recovery protocol until that design is implemented.
@@ -207,6 +209,15 @@ def require_current_schema_or_empty(database, *, require_existing=False):
             'room_members': {'room_id', 'member_id'},
             'group_batches': {'batch_id', 'sender', 'recipients_json', 'text_sha256', 'created', 'room_id', 'reply_to'},
             'group_batch_deliveries': {'batch_id', 'recipient', 'message_id'},
+            'credential_rotations': {
+                'id', 'session_id', 'state', 'old_sha256', 'new_sha256',
+                'old_file', 'new_file', 'created_at', 'updated_at',
+                'restart_window', 'retention_days', 'client_relaunched_at',
+                'retired_file', 'retired_at',
+            },
+            'retired_credentials': {
+                'token_sha256', 'session_id', 'retired_at', 'retention_days', 'retain_until',
+            },
         }
         if not required.keys() <= tables:
             raise ValueError('database schema requires explicit migration')
@@ -218,6 +229,8 @@ def require_current_schema_or_empty(database, *, require_existing=False):
             'room_members': {('room_id', 'member_id')},
             'group_batches': {('batch_id',)},
             'group_batch_deliveries': {('batch_id', 'recipient'), ('message_id',)},
+            'credential_rotations': {('id',)},
+            'retired_credentials': {('token_sha256',)},
         }
         for table, columns in required.items():
             info = list(db.execute(f'PRAGMA table_info({table})'))
@@ -232,17 +245,73 @@ def require_current_schema_or_empty(database, *, require_existing=False):
                     keys.add(tuple(row[2] for row in db.execute(f"PRAGMA index_info('{name}')")))
             if not unique_keys[table] <= keys:
                 raise ValueError('database schema lacks required uniqueness constraints')
+        rotation_index = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='one_open_rotation_per_session'").fetchone()
+        if rotation_index is None:
+            raise ValueError('database schema lacks the open-rotation uniqueness constraint')
+        index_info = list(db.execute('PRAGMA index_list(credential_rotations)'))
+        index = next((row for row in index_info if row[1] == rotation_index[0]), None)
+        if index is None or not index[2] or not index[4]:
+            raise ValueError('database schema lacks the open-rotation uniqueness constraint')
+        if tuple(row[2] for row in db.execute(
+                "PRAGMA index_info('one_open_rotation_per_session')")) != ('session_id',):
+            raise ValueError('database schema lacks the open-rotation uniqueness constraint')
+        index_sql = db.execute("SELECT sql FROM sqlite_master WHERE type='index' "
+                               "AND name='one_open_rotation_per_session'").fetchone()[0]
+        normalized_index_sql = ''.join(index_sql.lower().split())
+        expected_predicate = ("wherestatein('prepared','file_written','committed')or"
+                              "(state='verified'andretired_atisnull)")
+        if not normalized_index_sql.endswith(expected_predicate):
+            raise ValueError('database schema lacks the open-rotation uniqueness constraint')
+        if db.execute('PRAGMA user_version').fetchone()[0] != SCHEMA_VERSION:
+            raise ValueError('database schema version requires explicit migration')
 
 
 class Broker:
-    def __init__(self, database):
+    def __init__(self, database, *, initialize=True, read_only=False):
         self.database = str(database)
         self._message_condition = threading.Condition()
         self._shared_token_hashes = set()
+        self._read_only = bool(read_only)
+        if self._read_only and initialize:
+            raise ValueError('a read-only broker cannot initialize the schema')
+        if not initialize:
+            return
         with closing(self.connect()) as db, db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS session_credentials (
                     session_id TEXT PRIMARY KEY, token_sha256 TEXT UNIQUE NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS credential_rotations (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN
+                        ('prepared','file_written','committed','verified','abandoned')),
+                    old_sha256 TEXT NOT NULL,
+                    new_sha256 TEXT,
+                    old_file TEXT NOT NULL,
+                    new_file TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    restart_window TEXT NOT NULL,
+                    retention_days INTEGER NOT NULL CHECK(retention_days > 0),
+                    client_relaunched_at REAL,
+                    retired_file TEXT,
+                    retired_at REAL,
+                    CHECK(state NOT IN ('file_written','committed','verified') OR new_sha256 IS NOT NULL),
+                    CHECK(state != 'prepared' OR new_sha256 IS NULL)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS one_open_rotation_per_session
+                    ON credential_rotations(session_id)
+                    WHERE state IN ('prepared','file_written','committed')
+                       OR (state='verified' AND retired_at IS NULL);
+                CREATE TABLE IF NOT EXISTS retired_credentials (
+                    token_sha256 TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    retired_at REAL NOT NULL,
+                    retention_days INTEGER NOT NULL CHECK(retention_days > 0),
+                    retain_until REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY, kind TEXT NOT NULL,
@@ -296,9 +365,14 @@ class Broker:
                 columns = {row['name'] for row in db.execute(f'PRAGMA table_info({table})')}
                 if column not in columns:
                     db.execute(f'ALTER TABLE {table} ADD COLUMN {column} TEXT')
+            db.execute('PRAGMA user_version = {}'.format(SCHEMA_VERSION))
 
     def connect(self):
-        db = sqlite3.connect(self.database, timeout=10)
+        if self._read_only:
+            uri = Path(self.database).resolve().as_uri() + '?mode=ro'
+            db = sqlite3.connect(uri, uri=True, timeout=10)
+        else:
+            db = sqlite3.connect(self.database, timeout=10)
         db.row_factory = sqlite3.Row
         return db
 
@@ -331,6 +405,9 @@ class Broker:
                 raise ValueError('session credential already provisioned')
             if digest in self._shared_token_hashes:
                 raise ValueError('session credential must differ from shared token')
+            if db.execute('SELECT 1 FROM retired_credentials WHERE token_sha256=?',
+                          (digest,)).fetchone():
+                raise ValueError('retired credential cannot be bound again')
             other = db.execute('SELECT session_id FROM session_credentials '
                                'WHERE token_sha256=?', (digest,)).fetchone()
             if other is not None and other['session_id'] != session_id:
@@ -352,6 +429,9 @@ class Broker:
                 digest = self._credential_hash(credential)
             except ValueError:
                 raise PermissionError('unauthorized') from None
+            if db.execute('SELECT 1 FROM retired_credentials WHERE token_sha256=?',
+                          (digest,)).fetchone():
+                raise PermissionError('unauthorized')
             if row is not None and hmac.compare_digest(row['token_sha256'], digest):
                 return
         raise PermissionError('unauthorized')
@@ -362,8 +442,222 @@ class Broker:
         except ValueError:
             return False
         with closing(self.connect()) as db:
+            if db.execute('SELECT 1 FROM retired_credentials WHERE token_sha256=?',
+                          (digest,)).fetchone():
+                return False
             return db.execute('SELECT 1 FROM session_credentials WHERE token_sha256=?',
                               (digest,)).fetchone() is not None
+
+    def credential_is_available(self, credential):
+        """True only when credential is neither a loaded shared token nor bound."""
+        digest = self._credential_hash(credential)
+        if digest in self._shared_token_hashes:
+            return False
+        with closing(self.connect()) as db:
+            return (db.execute('SELECT 1 FROM session_credentials WHERE token_sha256=?',
+                               (digest,)).fetchone() is None and
+                    db.execute('SELECT 1 FROM retired_credentials WHERE token_sha256=?',
+                               (digest,)).fetchone() is None)
+
+    def bound_profile_for_credential(self, credential):
+        """Admin read: return the profile ID bound to this credential, or None."""
+        digest = self._credential_hash(credential)
+        with closing(self.connect()) as db:
+            row = db.execute('SELECT session_id FROM session_credentials WHERE token_sha256=?',
+                             (digest,)).fetchone()
+        return None if row is None else row['session_id']
+
+    def binding_for_profile(self, profile_id):
+        """Admin read: return a profile's current hash without exposing a token."""
+        with closing(self.connect()) as db:
+            row = db.execute('SELECT token_sha256 FROM session_credentials WHERE session_id=?',
+                             (profile_id,)).fetchone()
+        return None if row is None else row['token_sha256']
+
+    def retired_credential(self, digest):
+        with closing(self.connect()) as db:
+            row = db.execute('SELECT session_id, retired_at, retention_days, retain_until '
+                             'FROM retired_credentials WHERE token_sha256=?', (digest,)).fetchone()
+        return None if row is None else dict(row)
+
+    def rotation_for_profile(self, profile_id):
+        with closing(self.connect()) as db:
+            row = db.execute('SELECT * FROM credential_rotations WHERE session_id=? '
+                             'ORDER BY created_at DESC, rowid DESC LIMIT 1', (profile_id,)).fetchone()
+        return None if row is None else dict(row)
+
+    def begin_credential_rotation(self, rotation_id, profile_id, old_sha256, old_file,
+                                  new_file, restart_window, retention_days):
+        """Record one rotation intent, before creating the new credential file."""
+        if not self.valid_id(profile_id):
+            raise ValueError('invalid session id')
+        filename_re = re.compile(r'credential-[0-9a-f]{32}\.dpapi\Z')
+        if not filename_re.fullmatch(old_file) or not filename_re.fullmatch(new_file):
+            raise ValueError('invalid credential generation file name')
+        if not isinstance(restart_window, str) or not restart_window.strip():
+            raise ValueError('restart window is required')
+        credential_store.require_open_rotation_window(restart_window)
+        if isinstance(retention_days, bool) or not isinstance(retention_days, int) or retention_days < 1:
+            raise ValueError('retention days must be a positive integer')
+        now = time.time()
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            bound = db.execute('SELECT token_sha256 FROM session_credentials WHERE session_id=?',
+                               (profile_id,)).fetchone()
+            if bound is None or bound['token_sha256'] != old_sha256:
+                raise ValueError('profile binding changed before rotation started')
+            if db.execute("SELECT 1 FROM credential_rotations WHERE session_id=? AND "
+                          "(state IN ('prepared','file_written','committed') OR "
+                          "(state='verified' AND retired_at IS NULL))", (profile_id,)).fetchone():
+                raise ValueError('profile already has an open rotation')
+            if db.execute("SELECT 1 FROM credential_rotations WHERE "
+                          "(state IN ('prepared','file_written','committed') OR "
+                          "(state='verified' AND retired_at IS NULL)) LIMIT 1").fetchone():
+                raise ValueError('another profile rotation is open; finish it first')
+            if db.execute('SELECT 1 FROM retired_credentials WHERE token_sha256=?',
+                          (old_sha256,)).fetchone():
+                raise ValueError('current binding is already retired')
+            db.execute('INSERT INTO credential_rotations '
+                       '(id,session_id,state,old_sha256,new_sha256,old_file,new_file,created_at,'
+                       'updated_at,restart_window,retention_days) '
+                       "VALUES (?,?,'prepared',?,NULL,?,?,?,?,?,?)",
+                       (rotation_id, profile_id, old_sha256, old_file, new_file, now, now,
+                        restart_window.strip(), retention_days))
+
+    def mark_rotation_file_written(self, rotation_id, new_sha256):
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            changed = db.execute("UPDATE credential_rotations SET state='file_written', "
+                                 "new_sha256=?,updated_at=? WHERE id=? AND state='prepared'",
+                                 (new_sha256, time.time(), rotation_id)).rowcount
+            if changed != 1:
+                raise ValueError('rotation is no longer prepared')
+
+    def abandon_credential_rotation(self, rotation_id):
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            changed = db.execute("UPDATE credential_rotations SET state='abandoned',updated_at=? "
+                                 "WHERE id=? AND state IN ('prepared','file_written')",
+                                 (time.time(), rotation_id)).rowcount
+            if changed != 1:
+                raise ValueError('rotation cannot be abandoned in its current state')
+
+    def commit_credential_rotation(self, rotation_id, credential):
+        """CAS the binding and retire the old hash in one SQL transaction."""
+        digest = self._credential_hash(credential)
+        if digest in self._shared_token_hashes:
+            raise ValueError('session credential must differ from shared token')
+        now = time.time()
+        mismatch = False
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            rotation = db.execute('SELECT * FROM credential_rotations WHERE id=?',
+                                  (rotation_id,)).fetchone()
+            if rotation is None or rotation['state'] != 'file_written':
+                raise ValueError('rotation is not ready to commit')
+            if rotation['new_sha256'] != digest or digest == rotation['old_sha256']:
+                raise ValueError('new credential does not match the verified generation')
+            if db.execute('SELECT 1 FROM retired_credentials WHERE token_sha256=?',
+                          (digest,)).fetchone():
+                raise ValueError('retired credential cannot be bound again')
+            if db.execute('SELECT 1 FROM session_credentials WHERE token_sha256=?',
+                          (digest,)).fetchone():
+                raise ValueError('credential already assigned')
+            changed = db.execute('UPDATE session_credentials SET token_sha256=? '
+                                 'WHERE session_id=? AND token_sha256=?',
+                                 (digest, rotation['session_id'], rotation['old_sha256'])).rowcount
+            if changed != 1:
+                abandoned = db.execute(
+                    "UPDATE credential_rotations SET state='abandoned',updated_at=? "
+                    "WHERE id=? AND state='file_written'", (now, rotation_id)).rowcount
+                if abandoned != 1:
+                    raise sqlite3.IntegrityError('rotation state changed during compare-and-swap')
+                mismatch = True
+            else:
+                retain_until = now + rotation['retention_days'] * 86400
+                db.execute('INSERT INTO retired_credentials '
+                           '(token_sha256,session_id,retired_at,retention_days,retain_until) '
+                           'VALUES (?,?,?,?,?)',
+                           (rotation['old_sha256'], rotation['session_id'], now,
+                            rotation['retention_days'], retain_until))
+                committed = db.execute(
+                    "UPDATE credential_rotations SET state='committed',updated_at=? "
+                    "WHERE id=? AND state='file_written'", (now, rotation_id)).rowcount
+                if committed != 1:
+                    raise sqlite3.IntegrityError('rotation journal changed during commit')
+        if mismatch:
+            raise ValueError('profile binding changed; rotation was abandoned')
+
+    def mark_rotation_verified(self, rotation_id):
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            changed = db.execute("UPDATE credential_rotations SET state='verified',updated_at=? "
+                                 "WHERE id=? AND state='committed' AND client_relaunched_at IS NOT NULL",
+                                 (time.time(), rotation_id)).rowcount
+            if changed != 1:
+                raise ValueError('rotation is not awaiting verification after client relaunch')
+
+    def mark_rotation_client_relaunched(self, rotation_id):
+        now = time.time()
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            changed = db.execute('UPDATE credential_rotations SET client_relaunched_at=?, '
+                                 'updated_at=? WHERE id=? AND state=\'committed\' '
+                                 'AND client_relaunched_at IS NULL',
+                                 (now, now, rotation_id)).rowcount
+            if changed != 1:
+                raise ValueError('rotation is not awaiting client relaunch')
+
+    def mark_rotation_retired(self, rotation_id, retired_file):
+        now = time.time()
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            changed = db.execute('UPDATE credential_rotations SET retired_file=?,retired_at=?, '
+                                 'updated_at=? WHERE id=? AND state=\'verified\' AND retired_at IS NULL',
+                                 (retired_file, now, now, rotation_id)).rowcount
+            if changed != 1:
+                raise ValueError('rotation file is already retired or not verified')
+
+    def profile_status(self, profile_id):
+        """Admin read: whether a profile is bound and opted in. Returns no secret."""
+        if not self.valid_id(profile_id):
+            raise ValueError('invalid session id')
+        with closing(self.connect()) as db, db:
+            bound = db.execute('SELECT 1 FROM session_credentials WHERE session_id=?',
+                               (profile_id,)).fetchone() is not None
+            row = db.execute('SELECT opted_in FROM sessions WHERE id=?', (profile_id,)).fetchone()
+        return {'id': profile_id, 'bound': bound, 'opted_in': bool(row and row['opted_in'])}
+
+    def load_shared_token(self, token):
+        """Admit the active shared bearer into this instance's collision check.
+
+        Refuses when the token already equals a session credential in the database.
+        Later session provisioning on this instance then refuses the same token.
+        """
+        if not isinstance(token, str) or not token:
+            raise ValueError('shared token must be a non-empty string')
+        shared_digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT 1 FROM session_credentials WHERE token_sha256=?',
+                          (shared_digest,)).fetchone():
+                raise ValueError('shared token conflicts with a session credential')
+            if db.execute('SELECT 1 FROM retired_credentials WHERE token_sha256=?',
+                          (shared_digest,)).fetchone():
+                raise ValueError('a retired credential cannot be reused as a shared token')
+            self._shared_token_hashes.add(shared_digest)
+
+    def provision_profile(self, profile_id, credentials_dir, *, active_shared_token):
+        """Admin-only broker operation: provision one new profile credential.
+
+        active_shared_token is the running broker's shared bearer, or None when no
+        broker is running and therefore no active token exists. It is loaded into
+        the collision check before anything is written, so a generated credential
+        equal to it is refused and no file is created.
+        """
+        if active_shared_token is not None:
+            self.load_shared_token(active_shared_token)
+        return credential_store.provision_initial_profile(self, profile_id, credentials_dir)
 
     def register(self, data, *, credential=None):
         ident, kind = data.get('id'), data.get('kind')
@@ -956,13 +1250,7 @@ class DrainingHTTPServer(ThreadingHTTPServer):
 
 
 def handler_for(broker, token):
-    shared_digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
-    with closing(broker.connect()) as db, db:
-        db.execute('BEGIN IMMEDIATE')
-        if db.execute('SELECT 1 FROM session_credentials WHERE token_sha256=?',
-                      (shared_digest,)).fetchone():
-            raise ValueError('shared token conflicts with a session credential')
-        broker._shared_token_hashes.add(shared_digest)
+    broker.load_shared_token(token)
     class Handler(BaseHTTPRequestHandler):
         def handle_one_request(self):
             # Parse headers before rejection: closing a socket with unread HTTP
@@ -1156,6 +1444,48 @@ def _prepare_server(args):
     return server, args.state.read_bytes()
 
 
+# Stop-inhibit write retry policy. Retries are unlimited on purpose: giving up
+# would exit the broker with no stop note, and the supervisor could then
+# auto-recover a broker that was asked to stop. Backoff doubles from the base
+# up to the cap; the first few failures are logged, then at most once per
+# interval; an alert line is printed once at the alert threshold.
+FENCE_RETRY_BASE = 1.0
+FENCE_RETRY_CAP = 30.0
+FENCE_LOG_BURST = 3
+FENCE_LOG_INTERVAL = 60.0
+FENCE_ALERT_AFTER = 60
+
+
+def fence_retry_delay(failures):
+    """Seconds to wait after the given number of consecutive failures (>= 1)."""
+    return min(FENCE_RETRY_CAP, FENCE_RETRY_BASE * (2 ** min(failures - 1, 30)))
+
+
+class FenceRetryLog:
+    """Counts consecutive inhibit-write failures and paces their messages."""
+
+    def __init__(self, label):
+        self.label = label
+        self.failures = 0
+        self.last_logged = None
+
+    def failed(self, exc):
+        """Record one failure, print it if due, and return the wait before retrying."""
+        self.failures += 1
+        now = time.monotonic()
+        due = (self.failures <= FENCE_LOG_BURST or self.last_logged is None
+               or now - self.last_logged >= FENCE_LOG_INTERVAL)
+        if due:
+            self.last_logged = now
+            print('Stop inhibit not persisted for {} (attempt {}: {}); broker still serving, '
+                  'retrying.'.format(self.label, self.failures, exc), file=sys.stderr, flush=True)
+        if self.failures == FENCE_ALERT_AFTER:
+            print('ALERT: stop inhibit for {} has failed {} times in a row; broker still serving '
+                  'and retrying. Operator review required.'.format(self.label, self.failures),
+                  file=sys.stderr, flush=True)
+        return fence_retry_delay(self.failures)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--database', type=Path, default=ROOT / 'broker.sqlite3')
@@ -1210,13 +1540,19 @@ def main():
                         if line.strip() == 'stop':
                             break
                 finally:
-                    try:
-                        fence_stop()  # Must persist before the first begin_drain.
-                    except (OSError, RuntimeError):
-                        print('Stop inhibit could not be persisted; stop refused. '
-                              'Broker remains running; operator review required.',
-                              file=sys.stderr, flush=True)
-                        return
+                    # Must persist before the first begin_drain. A write failure is
+                    # retried with backoff, so a stop request is never silently dropped.
+                    retry = FenceRetryLog('stop request')
+                    while True:
+                        try:
+                            fence_stop()
+                            break
+                        except RuntimeError:
+                            print('Stop inhibit refused; stop refused. Broker remains running; '
+                                  'operator review required.', file=sys.stderr, flush=True)
+                            return
+                        except OSError as exc:
+                            time.sleep(retry.failed(exc))
                     with drain_mutex:
                         if stop_finalized.is_set():
                             return
@@ -1232,13 +1568,28 @@ def main():
         while not stop_serving.is_set():
             server.handle_request()
     finally:
-        try:
-            fence_stop()
-        except (OSError, RuntimeError):
-            server.server_close()
-            raise SystemExit('ROLLOUT BLOCKER: stop inhibit unavailable; state retained '
-                             'but process may exit unfenced and supervisor may auto-recover. '
-                             'Stop is not proven; do not deploy this recovery protocol.') from None
+        # A stop is not proven until its inhibit is on disk. If the write fails
+        # (OSError), keep serving so the supervisor still sees a live broker and
+        # does not auto-recover it, and retry on every pass. A refused inhibit
+        # (RuntimeError) still exits with the rollout blocker.
+        # Unlimited by design: exiting without a stop note would let the
+        # supervisor auto-recover a broker that was asked to stop. The request
+        # loop keeps running between attempts, so the broker stays reachable.
+        retry = FenceRetryLog('shutdown')
+        next_try = 0.0
+        while True:
+            if time.monotonic() >= next_try:
+                try:
+                    fence_stop()
+                    break
+                except RuntimeError:
+                    server.server_close()
+                    raise SystemExit('ROLLOUT BLOCKER: stop inhibit unavailable; state retained '
+                                     'but process may exit unfenced and supervisor may auto-recover. '
+                                     'Stop is not proven; do not deploy this recovery protocol.') from None
+                except OSError as exc:
+                    next_try = time.monotonic() + retry.failed(exc)
+            server.handle_request()
         # Serialize results and cleanup with a controller already draining;
         # never join a thread that might still be blocked reading stdin.
         with drain_mutex:

@@ -18,11 +18,36 @@ ROOT = Path(__file__).resolve().parent
 STATE = ROOT / 'broker-session.json'
 LOCK = ROOT / 'supervisor-session.json'
 LOG = ROOT / 'supervisor.log'
+# Graceful stop channel: service_stop.py creates this file. The supervisor exits
+# without any recovery launch. It never touches broker-session.json, the
+# stop-pending marker, or the recovery lock; those are left exactly as they are.
+STOP_REQUEST = ROOT / 'supervisor.stop-request'
 
 
 def log(message):
     with LOG.open('a', encoding='utf-8') as stream:
         stream.write(time.strftime('%Y-%m-%dT%H:%M:%S') + ' ' + message + '\n')
+
+
+def _honor_stop_request():
+    """Return True when a stop request was present. Consume it and log once."""
+    if not STOP_REQUEST.exists():
+        return False
+    log('stop requested; exiting without broker recovery')
+    try:
+        STOP_REQUEST.unlink()
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def _pause(seconds):
+    """Sleep in slices of at most one second, returning early when a stop request appears."""
+    remaining = seconds
+    while remaining > 0 and not STOP_REQUEST.exists():
+        step = min(1.0, remaining)
+        time.sleep(step)
+        remaining -= step
 
 
 def inspect_broker():
@@ -49,11 +74,17 @@ def run():
     try:
         previous = None
         while True:
+            if _honor_stop_request():
+                break
             current = inspect_broker()
             if current != previous:
                 log('broker state: ' + current)
                 previous = current
             if current == 'crashed':
+                # Re-checked right before any launch, so a stop requested during
+                # inspection cannot start a recovery.
+                if _honor_stop_request():
+                    break
                 # broker.py verifies that the old PID is absent and binds the
                 # original port before claiming the stale discovery file.
                 try:
@@ -61,7 +92,10 @@ def run():
                     # recovery gate, closing the check-to-launch race. Never
                     # clear an inhibit here, including malformed/stale markers.
                     require_recovery_allowed(STATE)
-                    child = subprocess.Popen([sys.executable, '-B', str(ROOT / 'broker.py'), '--recover'],
+                    # Launch through broker_launcher.py so the recovered broker holds the
+                    # control pipe; broker_stop.py can then request a drain instead of
+                    # timing out on a pipe-less process.
+                    child = subprocess.Popen([sys.executable, '-B', str(ROOT / 'broker_launcher.py'), '--recover'],
                                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                              stderr=subprocess.DEVNULL,
                                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
@@ -72,9 +106,9 @@ def run():
                     log('broker recovery inhibited; operator review required')
                 except OSError:
                     log('broker recovery could not launch; will retry later')
-                time.sleep(27)
+                _pause(27)
             else:
-                time.sleep(10)
+                _pause(10)
     finally:
         release(LOCK)
 

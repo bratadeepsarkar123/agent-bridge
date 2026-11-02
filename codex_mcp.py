@@ -9,6 +9,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 import time
 
@@ -90,9 +91,19 @@ def dispatch(name, args, client):
             if not isinstance(args['message_id'], str):
                 raise ValueError('message_id must be a canonical UUID string')
             send_options['message_id'] = args['message_id']
+        else:
+            # One ID per logical send. If the call fails, the error names it so a retry reuses it.
+            send_options['message_id'] = str(uuid.uuid4())
         if 'reply_to' in args:
             send_options['reply_to'] = args['reply_to']
-        return client.send(args['sender'], args['recipient'], args['text'], **send_options)
+        try:
+            return client.send(args['sender'], args['recipient'], args['text'], **send_options)
+        except ClientError as exc:
+            raise ClientError(
+                exc.code,
+                '{} Retry with message_id {} to avoid a duplicate.'.format(exc.message, send_options['message_id']),
+                exc.status,
+            ) from exc
     if name == 'bridge_send_group':
         return client.send_group(args['sender'], args['recipients'], args['text'], args['batch_id'])
     if name == 'bridge_inbox':
