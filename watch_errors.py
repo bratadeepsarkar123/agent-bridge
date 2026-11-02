@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 from codex_client import BrokerClient, ClientError
+import child_stop
 
 ROOT = Path(__file__).resolve().parent
 SENDER = 'system:tool-error-monitor'
@@ -124,11 +125,17 @@ def main():
     args = parser.parse_args()
     if args.interval < 5:
         parser.error('interval must be at least 5 seconds')
+    stop_request = child_stop.request_path(__file__)
     while True:
+        # Checked before every poll, so a stopped watcher starts no new work.
+        if stop_request.exists():
+            print(json.dumps({'status': 'stop_requested'}), flush=True)
+            child_stop.consume(stop_request)
+            return
         result = poll_once(args.transcript, args.recipient, args.state)
         if result.get('new_tool_errors') or result.get('alerts_queued'):
             print(json.dumps(result), flush=True)
-        time.sleep(args.interval)
+        child_stop.pause(args.interval, stop_request)
 
 
 if __name__ == '__main__':

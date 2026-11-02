@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+import child_stop
 from codex_client import BrokerClient, ClientError
 from codex_native import AppServerProxy
 from codex_queue import DeliveryLedger, QueueError, canonical_uuid
@@ -434,7 +435,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         previous = None
+        stop_request = child_stop.request_path(__file__)
         while not dispatcher.join(timeout=1):
+            if stop_request.exists():
+                # Break runs the finally block: the holder closes and the dispatcher stops.
+                print(json.dumps({'status': 'stop_requested'}), flush=True)
+                child_stop.consume(stop_request)
+                break
             if holder is not None:
                 status = (holder.status, holder.member_statuses)
                 if status != previous:

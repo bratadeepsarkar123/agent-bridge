@@ -1,5 +1,9 @@
 # Bridge candidate review
 
+Correction 2026-11-01: the repository is public on GitHub (`main`, commit
+`d6ff391`). The live two-chat bridge still runs the older
+`agent-bridge-experiment` build, not the code described here.
+
 This is a review copy, not a release. The branch is `bridge/integrated-plan`,
 based on `f57d010`; the candidate is committed as `4b710bf`. This public repo
 has no release tag and no live deployment.
@@ -43,7 +47,9 @@ this run. The app-server check does not exercise a real chat or prove idle wake.
 - The compact policy and lifecycle-intent prototype are isolated and unwired.
   They rely on a trusted caller and do not prove external writers have stopped.
 - Public-release uniqueness, licensing, secret review and maintenance have not
-  been established by this candidate; no public repository was created.
+  been established by this candidate. Correction 2026-11-01: the repository is
+  now public on GitHub (`bratadeepsarkar123/agent-bridge`, branch `main`); the
+  sentence above was written before publication.
 
 ## Commit and rollback
 
