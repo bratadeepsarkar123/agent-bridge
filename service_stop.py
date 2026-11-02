@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import child_stop
 from broker_stop import process_is_alive, stop_broker
 from service_guard import validate_service
 
@@ -321,8 +322,12 @@ class Stopper:
             self.child_pids.append((script, pid))
             if not _alive(self.controls, pid):
                 continue
+            # Children poll their own <stem>.stop-request file (see child_stop.py).
+            # A script that does not poll it will not stop, and the step fails safely.
+            request = child_stop.request_path(script, self.root)
             problem = _stop_process(self.controls, pid, script, self.exit_timeout,
-                                    lambda: self.controls.request_exit(pid), 'a graceful exit request')
+                                    lambda: self.controls.write_stop_request(request),
+                                    'a stop-request file')
             if problem:
                 return Step('children', FAILED, problem)
             stopped += 1

@@ -53,8 +53,12 @@ class FakeWorld:
             raise self.request_error
         if not path.exists():
             path.write_text('stop\n', encoding='utf-8')
-        pid = REQUEST_PIDS[path.name]
-        if pid in self.exits_on_request and pid in self.running:
+        pid = REQUEST_PIDS.get(path.name)
+        if pid is None:
+            # Child request: <script-stem>.stop-request for <script-stem>.py.
+            script = path.name[:-len('.stop-request')] + '.py'
+            pid = next((p for p, cmd in self.commands.items() if script in cmd), None)
+        if pid is not None and pid in self.exits_on_request and pid in self.running:
             self.running.discard(pid)
             path.unlink(missing_ok=True)
 
@@ -130,7 +134,8 @@ class ServiceStopTests(unittest.TestCase):
         stopper = Stopper(self.root, world.controls(), services_config=config, say=self.say)
         self.assertTrue(stopper.run())
         self.assertEqual([('request', 'service-guard.stop-request'), ('request', 'supervisor.stop-request'),
-                          ('drain', 120.0), ('exit', CHILD_A_PID), ('exit', CHILD_B_PID)], world.calls)
+                          ('drain', 120.0), ('request', 'native_worker.stop-request'),
+                          ('request', 'watch_session.stop-request')], world.calls)
         self.assertEqual(['ok', 'ok', 'ok', 'ok', 'ok'], [step.status for step in stopper.steps])
         self.assertIn('Stop confirmed', self.lines[-1])
 
@@ -213,8 +218,12 @@ class ServiceStopTests(unittest.TestCase):
         config = write_services(self.root)
         stopper = Stopper(self.root, world.controls(), services_config=config, say=self.say)
         self.assertTrue(stopper.run())
-        child_exits = [call for call in world.calls if call[0] == 'exit' and call[1] in (CHILD_A_PID, CHILD_B_PID)]
-        self.assertEqual([('exit', CHILD_A_PID), ('exit', CHILD_B_PID)], child_exits)
+        child_requests = [call for call in world.calls if call[0] == 'request' and call[1].endswith('.stop-request')
+                          and not call[1].startswith(('service-guard', 'supervisor'))]
+        self.assertEqual([('request', 'native_worker.stop-request'), ('request', 'watch_session.stop-request')],
+                         child_requests)
+        # Children are never signalled with taskkill-style exit requests any more.
+        self.assertFalse([call for call in world.calls if call[0] == 'exit'])
 
     def test_cleanup_fails_when_a_live_lock_remains(self):
         world = healthy_world(self.root)
