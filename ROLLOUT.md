@@ -135,8 +135,11 @@ Resolve these before a production-like cutover:
    and reported the shared-token check as not loaded; the same profile again was
    refused (exit 1) and wrote nothing; an invalid state file was refused (exit 1);
    `recover` reported the files and changed nothing; with an alive broker PID in the
-   state file the shared token was checked and provisioning succeeded. Not covered:
-   the refusal when the state token already belongs to a bound unprotected profile.
+   state file the shared token was checked and provisioning succeeded. The refusal
+   when the state token already belongs to a bound unprotected profile is now covered
+   by a real-process run on a disposable copy: `provision_profile.py provision` ran as
+   a subprocess with a live broker PID, exited 1 with "Refused:", created no
+   credential folder, printed no token, and left the binding count at 1.
    Gap A: a state-file token that
    already belongs to a bound profile is now a clean refusal (exit 1, "Refused:"
    message, no traceback, no file or directory created). Gap B: `provision` checks
@@ -180,7 +183,33 @@ Resolve these before a production-like cutover:
    The launcher checks the journaled hash and file inventory, sets the two
    credential variables only for that client launch, then restores the caller's
    values. It records the relaunch only after a successful client exit. Automated
-   tests use a fake client; no real `claude.exe` launch is part of this work.
+   tests use a fake client.
+
+   **Real-process evidence (disposable copy, branch `feature/adapter-scoped-guard`):**
+   `launch-claude.ps1 -FreshSessionId <new UUID> -CredentialsDir <copy>\credentials --version`
+   ran the real `claude.exe` (2.1.316) and exited 0. The fresh identity was bound as a
+   protected profile with exactly one DPAPI file. The client was given `--version` only,
+   so no login or trust prompt was needed. Not directly observed: the child's
+   environment during that run (the variables are set in the launcher's own process).
+
+   **Adapter credential guard (item 6, the adapter part):** `adapter_scoped_guard.py`
+   refuses a session switch while `BRIDGE_SESSION_CREDENTIAL_FILE` is set. The decision
+   was taken by three subagents with different biases; all three chose refusal (fail
+   closed), so `claude_adapter.py` keeps its original ID and never registers or sends as
+   the new one. `claude_adapter.py` has uncommitted operator work and is not edited here.
+   The operator adds this hook to `ClaudeAdapter.current_id`, directly above the line
+   `with self.identity_lock:`, plus the import shown below. Applied to a copy of the
+   current working file and run through the real method with a mocked broker: the switch
+   was refused once and never registered, and an unscoped switch still worked.
+
+   ```python
+   from adapter_scoped_guard import switch_allowed, SwitchRefusalLog
+   # ... inside current_id, after `live = ...` and the early return:
+           if not switch_allowed(self.session_id, live):
+               if not hasattr(self, '_switch_refusals'):
+                   self._switch_refusals = SwitchRefusalLog(self.stderr)
+               return self._switch_refusals.refuse(self.session_id, live)
+   ```
 
 7. **Some clients only support one credential per process.** `native_worker.py`
    has no credential argument and reads the process environment; the MCP client
@@ -421,10 +450,10 @@ state, credentials_dir, new_set_dir)`. It copies the database with
 - Restore only to NEW paths with `bridge_backup.restore_set(set_dir,
 new_database, new_credentials_dir, expected_database_sha256=...,
 retired_database=current_database)`. The separate current database is required:
-it supplies retirement records that an older backup cannot contain. The expected
-digest must be typed by a person from the set they reviewed (the newest set).
-Restore refuses a set whose binding or files contain any hash in that ledger and
-never replaces an existing database or credential file.
+  it supplies retirement records that an older backup cannot contain. The expected
+  digest must be typed by a person from the set they reviewed (the newest set).
+  Restore refuses a set whose binding or files contain any hash in that ledger and
+  never replaces an existing database or credential file.
 - Keep older sets. Do not overwrite any set.
 - Rollback status: the data half is rehearsed (tests/test_rollback_runbook_rehearsal.py).
   No compatible security-enforcing rollback build exists yet, so an upgrade of the
