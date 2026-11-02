@@ -78,11 +78,11 @@ def stop_marker_path(state):
     fence. fsync/hard-link publication handles ordinary process crashes, not an
     unconditional power-loss guarantee (especially Windows directory metadata).
 
-    ROLLOUT BLOCKER: if finalization cannot publish an inhibit before the process
-    exits, discovery can remain without a marker. The supervisor can then regard
-    that exit as a crash and auto-recover. Refusing a controller stop while still
-    serving does not solve startup/finalization exceptions or subsequent process
-    death. A durable pre-armed recovery policy/independent supervisor protocol is
+    ROLLOUT BLOCKER (narrowed 2026-11-02): a failed marker write no longer lets the
+    broker exit; it keeps serving and retries (see main()). The remaining gap is a
+    process that dies before any marker exists (hard kill, power loss, or an exit
+    before publication succeeds). Discovery can then remain without a marker, and
+    the supervisor can regard that death as a crash and auto-recover. A durable pre-armed recovery policy/independent supervisor protocol is
     required to close this gap; stderr, exit status, or an in-memory flag cannot
     substitute for persistent coordination. Do not deploy this as a complete
     fail-closed stop/recovery protocol until that design is implemented.
@@ -1156,6 +1156,48 @@ def _prepare_server(args):
     return server, args.state.read_bytes()
 
 
+# Stop-inhibit write retry policy. Retries are unlimited on purpose: giving up
+# would exit the broker with no stop note, and the supervisor could then
+# auto-recover a broker that was asked to stop. Backoff doubles from the base
+# up to the cap; the first few failures are logged, then at most once per
+# interval; an alert line is printed once at the alert threshold.
+FENCE_RETRY_BASE = 1.0
+FENCE_RETRY_CAP = 30.0
+FENCE_LOG_BURST = 3
+FENCE_LOG_INTERVAL = 60.0
+FENCE_ALERT_AFTER = 60
+
+
+def fence_retry_delay(failures):
+    """Seconds to wait after the given number of consecutive failures (>= 1)."""
+    return min(FENCE_RETRY_CAP, FENCE_RETRY_BASE * (2 ** min(failures - 1, 30)))
+
+
+class FenceRetryLog:
+    """Counts consecutive inhibit-write failures and paces their messages."""
+
+    def __init__(self, label):
+        self.label = label
+        self.failures = 0
+        self.last_logged = None
+
+    def failed(self, exc):
+        """Record one failure, print it if due, and return the wait before retrying."""
+        self.failures += 1
+        now = time.monotonic()
+        due = (self.failures <= FENCE_LOG_BURST or self.last_logged is None
+               or now - self.last_logged >= FENCE_LOG_INTERVAL)
+        if due:
+            self.last_logged = now
+            print('Stop inhibit not persisted for {} (attempt {}: {}); broker still serving, '
+                  'retrying.'.format(self.label, self.failures, exc), file=sys.stderr, flush=True)
+        if self.failures == FENCE_ALERT_AFTER:
+            print('ALERT: stop inhibit for {} has failed {} times in a row; broker still serving '
+                  'and retrying. Operator review required.'.format(self.label, self.failures),
+                  file=sys.stderr, flush=True)
+        return fence_retry_delay(self.failures)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--database', type=Path, default=ROOT / 'broker.sqlite3')
@@ -1210,13 +1252,19 @@ def main():
                         if line.strip() == 'stop':
                             break
                 finally:
-                    try:
-                        fence_stop()  # Must persist before the first begin_drain.
-                    except (OSError, RuntimeError):
-                        print('Stop inhibit could not be persisted; stop refused. '
-                              'Broker remains running; operator review required.',
-                              file=sys.stderr, flush=True)
-                        return
+                    # Must persist before the first begin_drain. A write failure is
+                    # retried with backoff, so a stop request is never silently dropped.
+                    retry = FenceRetryLog('stop request')
+                    while True:
+                        try:
+                            fence_stop()
+                            break
+                        except RuntimeError:
+                            print('Stop inhibit refused; stop refused. Broker remains running; '
+                                  'operator review required.', file=sys.stderr, flush=True)
+                            return
+                        except OSError as exc:
+                            time.sleep(retry.failed(exc))
                     with drain_mutex:
                         if stop_finalized.is_set():
                             return
@@ -1232,13 +1280,28 @@ def main():
         while not stop_serving.is_set():
             server.handle_request()
     finally:
-        try:
-            fence_stop()
-        except (OSError, RuntimeError):
-            server.server_close()
-            raise SystemExit('ROLLOUT BLOCKER: stop inhibit unavailable; state retained '
-                             'but process may exit unfenced and supervisor may auto-recover. '
-                             'Stop is not proven; do not deploy this recovery protocol.') from None
+        # A stop is not proven until its inhibit is on disk. If the write fails
+        # (OSError), keep serving so the supervisor still sees a live broker and
+        # does not auto-recover it, and retry on every pass. A refused inhibit
+        # (RuntimeError) still exits with the rollout blocker.
+        # Unlimited by design: exiting without a stop note would let the
+        # supervisor auto-recover a broker that was asked to stop. The request
+        # loop keeps running between attempts, so the broker stays reachable.
+        retry = FenceRetryLog('shutdown')
+        next_try = 0.0
+        while True:
+            if time.monotonic() >= next_try:
+                try:
+                    fence_stop()
+                    break
+                except RuntimeError:
+                    server.server_close()
+                    raise SystemExit('ROLLOUT BLOCKER: stop inhibit unavailable; state retained '
+                                     'but process may exit unfenced and supervisor may auto-recover. '
+                                     'Stop is not proven; do not deploy this recovery protocol.') from None
+                except OSError as exc:
+                    next_try = time.monotonic() + retry.failed(exc)
+            server.handle_request()
         # Serialize results and cleanup with a controller already draining;
         # never join a thread that might still be blocked reading stdin.
         with drain_mutex:

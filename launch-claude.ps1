@@ -19,7 +19,7 @@ if (-not $PrepareOnly -or $CheckServices) {
     $client = Join-Path $PSScriptRoot 'codex_client.py'
     & $python -B $client discover *> $null
     if ($LASTEXITCODE -ne 0) {
-        $brokerArgs = @((Join-Path $PSScriptRoot 'broker.py'))
+        $brokerArgs = @((Join-Path $PSScriptRoot 'broker_launcher.py'))
         if (Test-Path -LiteralPath $state) {
             try {
                 $brokerState = Get-Content -LiteralPath $state -Raw | ConvertFrom-Json

@@ -61,8 +61,25 @@ class CodexMcpTests(unittest.TestCase):
         args = {'sender': THREAD, 'recipient': GROUP_RECIPIENTS[0], 'text': 'answer',
                 'reply_to': GROUP_RECIPIENTS[1]}
         self.assertEqual(expected, codex_mcp.dispatch('bridge_send', args, client))
-        client.send.assert_called_once_with(
-            THREAD, GROUP_RECIPIENTS[0], 'answer', reply_to=GROUP_RECIPIENTS[1])
+        client.send.assert_called_once()
+        call_args, call_kwargs = client.send.call_args
+        self.assertEqual((THREAD, GROUP_RECIPIENTS[0], 'answer'), call_args)
+        self.assertEqual(GROUP_RECIPIENTS[1], call_kwargs['reply_to'])
+        self.assertRegex(call_kwargs['message_id'], r'^[0-9a-f-]{36}$')
+
+    def test_direct_send_without_id_generates_one_and_failure_names_it(self):
+        from codex_client import ClientError
+        client = Mock()
+        client.send.side_effect = ClientError('unavailable', 'broker not reachable')
+        args = {'sender': THREAD, 'recipient': GROUP_RECIPIENTS[0], 'text': 'hello'}
+
+        with self.assertRaises(ClientError) as ctx:
+            codex_mcp.dispatch('bridge_send', args, client)
+
+        sent_id = client.send.call_args.kwargs['message_id']
+        self.assertIn(sent_id, ctx.exception.message)
+        self.assertIn('Retry with message_id', ctx.exception.message)
+        self.assertEqual('unavailable', ctx.exception.code)
 
     def test_direct_send_forwards_caller_message_id_for_retry_reuse(self):
         client = Mock()

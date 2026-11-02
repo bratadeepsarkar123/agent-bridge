@@ -7,10 +7,11 @@ not active there. No live process state, broker database, session database, or
 chat was inspected for this documentation update. No service was restarted. No
 tests were run as part of this documentation update.
 
-The staged working tree is modified and contains untracked implementation
-files, so it is not an immutable release artifact. Record and review a clean
-source revision before any rollout. Do not copy this directory over the live
-project as an ad hoc deployment.
+Correction (2026-11-02): the staged tree is now committed at `5293321` on the
+local branch `bridge/integrated-plan`, with a clean working tree. That commit is
+local only; it is not on the public remote (`origin/main` is `d6ff391`). Review
+the commit before any rollout. Do not copy this directory over the live project
+as an ad hoc deployment.
 
 `lifecycle_intent_prototype.py` is a synthetic-only experiment. Its retained
 test-owned process handles and stop acknowledgements do not control the real
@@ -36,9 +37,18 @@ flushed recovery-inhibit marker before closing application admission. On Windows
 directory metadata is not guaranteed to survive power loss or rollback. After
 successful marker publication, the supervisor's recovery path is fenced while
 the marker remains, including after a failed drain. If marker publication fails,
-drain is refused; if the broker then exits with discovery state retained and no
-marker, the supervisor can still classify it as crashed and auto-recover. That
-publication-failure path remains a rollout blocker. A `stop` command or pipe EOF
+drain is refused and the broker keeps serving (it does not exit), retrying the
+marker on each pass, so the supervisor never sees it as crashed. The retry is
+unlimited on purpose: exiting would leave no stop note and let the supervisor
+auto-recover a broker that was asked to stop. Retries back off from 1 s, doubling
+to a 30 s cap. The first three failures are logged, then at most once a minute;
+an `ALERT` line is printed at 60 consecutive failures, and the broker keeps
+running for operator review. A `stop` line whose marker write fails is retried
+the same way (it is not dropped); only a refused publication (`RuntimeError`)
+is refused, with a printed message. A refused
+publication that makes the broker exit (no marker, discovery retained) still
+exists only where the marker already exists or discovery ownership changed; the
+startup chokepoint refuses recovery in the first case. A `stop` command or pipe EOF
 rejects new parsed requests with 503, interrupts incomplete requests, and waits
 for tracked handlers up to `--drain-timeout`. A failed drain reports failure and
 retains discovery state and the marker; the controller does not perform a second
@@ -57,27 +67,31 @@ coordinated stop/restart path.
 
 Resolve these before a production-like cutover:
 
-1. **No coordinated service stop/restart command.** `broker.py --control-stdin`
-   can drain an isolated broker, but it is not wired to the service guard,
-   supervisor, or production launcher. After successful stop-marker publication,
-   the recovery fence blocks supervisor auto-recovery while the marker remains,
-   including after a failed drain. If marker publication fails, drain is refused;
-   if the broker then exits with discovery state retained and no marker, the
-   supervisor can still auto-recover it as a crash. This publication-failure
-   path blocks rollout. New connections can also extend the drain. A failed drain
-   does not get a second drain wait, while successful drain may still need final
-   bounded server/process cleanup. `service_guard.py` and `supervisor.py` still
-   have no coordinated stop control. Force-stopping a child can cause it to
-   respawn; force-stopping a parent can skip its `finally` cleanup and leave lock
-   files. A reviewed helper must stop the guard first, stop the supervisor, drain
-   and stop children in order, and confirm broker cleanup. Until then, a
+1. **No coordinated service-level stop/restart command.** `broker_stop.py` now
+   requests a broker drain through the request file watched by `broker_launcher.py`;
+   the staged starter, the Claude recovery launcher, and supervisor recovery all
+   start the broker through `broker_launcher.py`, so each holds the control pipe.
+   This still does not coordinate the service guard or the supervisor process
+   itself. After successful stop-marker
+   publication, the recovery fence blocks supervisor auto-recovery while the
+   marker remains, including after a failed drain. If marker publication fails,
+   drain is refused and the broker keeps serving, retrying the marker with
+   backoff (see above); it does not exit into an auto-recoverable state. A hard
+   kill before publication remains a plain crash. New connections can also
+   extend the drain. A failed drain does not get a second drain wait, while
+   successful drain may still need final bounded server/process cleanup.
+   `service_guard.py` and `supervisor.py` still have no coordinated stop control.
+   Force-stopping a child can cause it to respawn; force-stopping a parent can
+   skip its `finally` cleanup and leave lock files. A reviewed service-level
+   helper must stop the guard first, stop the supervisor, request the broker
+   drain, stop remaining children in order, and confirm cleanup. Until then, a
    controlled live restart is blocked.
 2. **The staged starter is path-bound.** `start-broker.ps1` recognizes a running
    broker only when its command line contains `agent-bridge-experiment`. It is
    wrong for a staged checkout and must be made path-independent and tested.
 3. **No supported credential provisioning command.** The only provisioning
    entry point is the Python helper `credential_store.provision_initial_profile`.
-   There is no CLI or operator UI, no ACL creation/verification, and no recovery
+   There is no CLI or operator UI, and no recovery
    flow that identifies an orphaned credential file after an ambiguous failure.
    Its caller must create a private directory. A failure after the database
    commit can leave the caller unsure whether the profile is bound; do not retry
@@ -144,9 +158,13 @@ duplicate. Do not treat no-ID direct sends as retry-safe.
   backup API only while the broker is stopped. Protect any copy of
   `broker-session.json` as a secret; it contains the shared bearer.
 - Create a dedicated credential directory under the current user's profile.
-  Remove inherited ACLs and grant access only to that user and `SYSTEM`; inspect
-  the resulting ACL before provisioning. `os.open(..., 0o600)` in the helper is
-  not a Windows ACL guarantee.
+  Remove inherited ACLs and grant access only to that user and `SYSTEM`.
+  `os.open(..., 0o600)` in the helper is not a Windows ACL guarantee. The code
+  now enforces the check: `credential_store.apply_private_acl` sets the ACL with
+  `icacls.exe` and verifies it, `provision_initial_profile` refuses any directory
+  whose ACL is not private (fail closed, no file written), `bridge_backup.make_set`
+  makes its set and credentials directories private, and `restore_set` refuses an
+  existing credentials directory and makes the new one private.
 
 ## Initial credential provisioning
 
@@ -172,10 +190,13 @@ are resolved and the staged broker code is the reviewed release.
    & icacls.exe $credentialDir
    ```
 
-   Verify the resulting ACL contains no unrelated users or groups before
-   continuing. Never put a token in a command argument, shell history,
+   The provisioning helper repeats this check and stops if any other user,
+   group, or DENY entry is present. Still inspect the printed ACL yourself: the
+   check trusts the current account name from the environment and does not
+   verify the owner SID. Never put a token in a command argument, shell history,
    environment variable, log, or checked-in file. The environment variables
    below contain only a file path and format.
+
 3. With the broker stopped, call the local provisioning API against the exact
    broker database path. For example, after the code gates are resolved:
 
@@ -206,6 +227,7 @@ are resolved and the staged broker code is the reviewed release.
    printed result contains the profile ID and credential-file path, not the
    token. `Broker(...)` runs schema setup, which is another reason to run only
    with the broker stopped and against the intended database.
+
 4. If the command reports any error or the result is uncertain, stop. Do not
    retry for the same profile: an encrypted orphan or a committed binding may
    exist. The current code has no safe reconciliation command. Resolve this with
@@ -219,8 +241,9 @@ are resolved and the staged broker code is the reviewed release.
 
    Start the client under the intended Windows user. Do not set these values
    machine-wide. For a pooled dispatcher, use one explicit `--credential
-   <profile-id>=<file-path>` for each selected protected recipient. The native
+<profile-id>=<file-path>` for each selected protected recipient. The native
    worker has no equivalent per-recipient option yet.
+
 6. Explicitly opt in the intended profile using the client with that credential
    loaded. The Codex CLI supports:
 
@@ -232,6 +255,7 @@ are resolved and the staged broker code is the reviewed release.
    the current launcher cannot bind a newly generated session ID before launch;
    do not use that path for a protected new Claude profile until the launcher
    flow is fixed.
+
 7. Verify authorization without reading messages. A local check can call
    `BrokerClient().check_session(profile_id)` with the scoped environment set;
    confirm only the expected ID and kind are returned. This proves the broker
@@ -301,3 +325,23 @@ support scoped credentials. This draft does not claim those gaps are fixed,
 that staged tests pass, or that a restart/rollback has been rehearsed. A rollback
 to the pre-upgrade live broker is explicitly unsafe; stop serving if no compatible
 security-enforcing release is available.
+
+## Paired backup and restore (gate items 3, 4, 6)
+
+- Make a set only while the broker is stopped: `bridge_backup.make_set(database,
+state, credentials_dir, new_set_dir)`. It copies the database with
+  `backup_tool.checked_backup` (refuses if discovery state or a stop note exists),
+  copies every `credential-*.dpapi` file, and writes `manifest.json` with digests.
+  It refuses unless every credential bound in the database has its file.
+- Restore only to NEW paths with `bridge_backup.restore_set(set_dir,
+new_database, new_credentials_dir, expected_database_sha256=...)`. The
+  expected digest must be typed by a person from the set they reviewed (the
+  newest set). Restore never replaces an existing database or credential file.
+- Keep older sets. Do not overwrite any set.
+- Rollback status: the data half is rehearsed (tests/test_rollback_runbook_rehearsal.py).
+  No compatible security-enforcing rollback build exists yet, so an upgrade of the
+  live bridge stays blocked and the bridge stays stopped.
+- Credential directory and file ACLs are checked by code (Windows `icacls`; only the
+  current account and `SYSTEM` may hold entries; DENY entries fail). Limits: the owner
+  SID is not checked, and same-account software can still decrypt DPAPI credentials
+  (accepted, see LIMITS_REGISTER.md item 5). Inspect the ACL before relying on a set.

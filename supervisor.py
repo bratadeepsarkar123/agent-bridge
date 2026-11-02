@@ -61,7 +61,10 @@ def run():
                     # recovery gate, closing the check-to-launch race. Never
                     # clear an inhibit here, including malformed/stale markers.
                     require_recovery_allowed(STATE)
-                    child = subprocess.Popen([sys.executable, '-B', str(ROOT / 'broker.py'), '--recover'],
+                    # Launch through broker_launcher.py so the recovered broker holds the
+                    # control pipe; broker_stop.py can then request a drain instead of
+                    # timing out on a pipe-less process.
+                    child = subprocess.Popen([sys.executable, '-B', str(ROOT / 'broker_launcher.py'), '--recover'],
                                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                              stderr=subprocess.DEVNULL,
                                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
