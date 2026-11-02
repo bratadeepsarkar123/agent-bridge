@@ -103,18 +103,41 @@ Resolve these before a production-like cutover:
    supervisor, then waits with the same bounded timeout. A process that does not
    exit is reported as a failed step. It is not force-killed, and the request file
    stays so the process can still exit on its next check. A leftover request file
-   fails the cleanup check. Tests use fakes and temp folders only. Still open: on
-   Windows, the children's exit request is a non-forced `taskkill`, which may not
-   stop a windowless process. Live use stays blocked until a real process has been
-   stopped this way on a disposable copy.
+   fails the cleanup check. Tests use fakes and temp folders only.
+
+   **Real-process evidence (disposable copy of `f1fa36e`, no live folder touched):**
+   every stoppable child now polls its own `<script>.stop-request` file (no
+   `taskkill`). On a copy with its own broker and registered Codex recipients:
+   `native_worker.py` and `multi_dispatcher.py` each ran, polled the broker with no
+   errors, and exited within about 20 s of the stop request (the helper waits 30 s).
+   `native_worker.py` released its lock. `service_stop.py restart` drained the copy's
+   broker, started a new broker, and started a supervisor; `service_stop.py stop`
+   then stopped the supervisor and broker, and no copy process was left. The
+   children were not run under `--services-config` (no real guard/children set).
+   Still NOT done: the live broker. Live use still needs the owner's separate yes.
 
 2. **The staged starter is path-bound.** `start-broker.ps1` recognizes a running
    broker only when its command line contains `agent-bridge-experiment`. It is
    wrong for a staged checkout and must be made path-independent and tested.
+
+   **Status (closed in code and checked on a disposable copy):** the starter now
+   matches its own checkout's `broker.py` or `broker_launcher.py` as a whole path.
+   Real-process check: a harmless test process whose command line named the copy's
+   broker made `-DryRun` refuse; a second copy at another path gave the dry-run
+   message; a state file pointing at the live test process reported "already
+   running". The test process was stopped and the copies were deleted.
+
 3. **Provisioning CLI added (closed in code on this branch, pending review and a
    real-process check; both gaps found by the real-process check are fixed in
    code, and the real-process re-check is still needed).** `provision_profile.py`
-   offers `provision`, `check`, and `recover`. Gap A: a state-file token that
+   offers `provision`, `check`, and `recover`. **Real-process check (disposable copy,
+   temp database):** a first provision with no broker state wrote one profile file
+   and reported the shared-token check as not loaded; the same profile again was
+   refused (exit 1) and wrote nothing; an invalid state file was refused (exit 1);
+   `recover` reported the files and changed nothing; with an alive broker PID in the
+   state file the shared token was checked and provisioning succeeded. Not covered:
+   the refusal when the state token already belongs to a bound unprotected profile.
+   Gap A: a state-file token that
    already belongs to a bound profile is now a clean refusal (exit 1, "Refused:"
    message, no traceback, no file or directory created). Gap B: `provision` checks
    that the recorded broker PID is alive before it trusts the state-file token; a
